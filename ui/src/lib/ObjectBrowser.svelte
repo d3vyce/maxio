@@ -16,13 +16,17 @@
   import Check from 'lucide-svelte/icons/check'
   import FolderPlus from 'lucide-svelte/icons/folder-plus'
   import History from 'lucide-svelte/icons/history'
+  import Eye from 'lucide-svelte/icons/eye'
   import VersionHistory from './VersionHistory.svelte'
+  import FilePreview from './FilePreview.svelte'
+  import { isPreviewable } from '$lib/preview'
   import { toast } from '$lib/toast'
   import { objectKeys, settingsKeys } from '$lib/api/keys'
-  import { createFolder as createFolderApi, deleteObject as deleteObjectApi, listObjects, presignObject, uploadObject } from '$lib/api/objects'
+  import { createFolder as createFolderApi, deleteObject as deleteObjectApi, downloadUrl, listObjects, presignObject, uploadObject, type S3File } from '$lib/api/objects'
   import { getVersioning } from '$lib/api/settings'
-  import { ApiError, encodeObjectKey } from '$lib/api/http'
+  import { ApiError } from '$lib/api/http'
   import { queryClient } from '$lib/query/client'
+  import { displayName } from '$lib/utils'
 
   interface Props {
     bucket: string
@@ -39,6 +43,7 @@
   let newFolderName = $state('')
   let shareMenuPos = $state({ top: 0, left: 0 })
   let versionKey = $state<string | null>(null)
+  let previewFile = $state<S3File | null>(null)
   let pendingDelete = $state<{ key: string; kind: 'object' | 'folder' } | null>(null)
   let createFolderInput = $state<HTMLInputElement | null>(null)
 
@@ -123,12 +128,6 @@
     notifyPrefix()
   }
 
-  function displayName(fullPath: string): string {
-    const trimmed = fullPath.endsWith('/') ? fullPath.slice(0, -1) : fullPath
-    const lastSlash = trimmed.lastIndexOf('/')
-    return lastSlash >= 0 ? trimmed.slice(lastSlash + 1) : trimmed
-  }
-
   function formatSize(bytes: number): string {
     if (bytes < 1024) return `${bytes} B`
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
@@ -156,10 +155,6 @@
     }
     return crumbs
   })
-
-  function downloadUrl(key: string): string {
-    return `/api/buckets/${encodeURIComponent(bucket)}/download/${encodeObjectKey(key)}`
-  }
 
   async function handleUpload() {
     const inputFiles = fileInput?.files
@@ -279,6 +274,7 @@
       <Table.Header>
         <Table.Row>
           <Table.Head>Name</Table.Head>
+          <Table.Head class="w-48">Type</Table.Head>
           <Table.Head class="w-28 text-right">Size</Table.Head>
           <Table.Head class="w-48">Modified</Table.Head>
           <Table.Head class="w-24"></Table.Head>
@@ -293,9 +289,10 @@
                 <span class="font-medium">{displayName(p)}/</span>
               </span>
             </Table.Cell>
+            <Table.Cell class="text-muted-foreground">&mdash;</Table.Cell>
             <Table.Cell class="text-right text-muted-foreground">&mdash;</Table.Cell>
             <Table.Cell class="text-muted-foreground">&mdash;</Table.Cell>
-            <Table.Cell>
+            <Table.Cell class="w-24 text-right">
               {#if emptyPrefixes.has(p)}
                 <button
                   class="text-muted-foreground hover:text-destructive transition-colors"
@@ -316,10 +313,11 @@
                 <span class="font-medium">{displayName(file.key)}</span>
               </span>
             </Table.Cell>
+            <Table.Cell class="truncate text-muted-foreground">{file.contentType || '—'}</Table.Cell>
             <Table.Cell class="text-right text-muted-foreground">{formatSize(file.size)}</Table.Cell>
             <Table.Cell class="text-muted-foreground">{formatDate(file.lastModified)}</Table.Cell>
             <Table.Cell class="w-24">
-              <span class="flex items-center gap-4">
+              <span class="flex items-center justify-end gap-4">
                 {#if versioningEnabled}
                   <button
                     class="text-muted-foreground hover:text-foreground transition-colors"
@@ -327,6 +325,15 @@
                     title="Version history"
                   >
                     <History class="size-4" />
+                  </button>
+                {/if}
+                {#if isPreviewable(file.contentType)}
+                  <button
+                    class="text-muted-foreground hover:text-foreground transition-colors"
+                    onclick={(e) => { e.stopPropagation(); previewFile = file }}
+                    title="Preview"
+                  >
+                    <Eye class="size-4" />
                   </button>
                 {/if}
                 <button
@@ -340,7 +347,7 @@
                     <Share2 class="size-4" />
                   {/if}
                 </button>
-                <a href={downloadUrl(file.key)} class="text-muted-foreground hover:text-foreground" onclick={(e) => e.stopPropagation()} title="Download">
+                <a href={downloadUrl(bucket, file.key)} class="text-muted-foreground hover:text-foreground" onclick={(e) => e.stopPropagation()} title="Download">
                   <Download class="size-4" />
                 </a>
                 <button
@@ -355,7 +362,7 @@
           </Table.Row>
           {#if versionKey === file.key}
             <Table.Row>
-              <Table.Cell colspan={4} class="p-0">
+              <Table.Cell colspan={5} class="p-0">
                 <div class="p-2">
                   <VersionHistory
                     {bucket}
@@ -418,6 +425,16 @@
       </button>
     {/each}
   </div>
+{/if}
+
+{#if previewFile}
+  <FilePreview
+    {bucket}
+    objectKey={previewFile.key}
+    contentType={previewFile.contentType}
+    size={previewFile.size}
+    onClose={() => (previewFile = null)}
+  />
 {/if}
 
 {#if pendingDelete}

@@ -484,6 +484,7 @@ pub async fn list_objects(
                 "size": obj.size,
                 "lastModified": obj.last_modified,
                 "etag": obj.etag,
+                "contentType": obj.content_type,
             }));
         }
     }
