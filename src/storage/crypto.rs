@@ -418,16 +418,21 @@ impl AsyncRead for FrameDecryptor {
                 Poll::Ready(Ok(())) => {
                     let n = read_buf.filled().len();
                     if n == 0 {
-                        if this.frame_filled == 0 {
-                            // Clean EOF at a frame boundary.
-                            this.done = true;
-                            return Poll::Ready(Ok(()));
+                        // EOF from the underlying reader. We only reach this
+                        // read when `remaining > 0 && frame_target > 0`, i.e.
+                        // more plaintext is definitively expected (a complete
+                        // stream exits earlier once `frame_target`/`remaining`
+                        // hit 0). So EOF here is always truncation — even at
+                        // an exact frame boundary (`frame_filled == 0`), which
+                        // previously masqueraded as a clean end-of-stream and
+                        // let truncated part files decrypt to silently short
+                        // output.
+                        let msg = if this.frame_filled == 0 {
+                            "truncated encrypted stream: EOF at frame boundary with plaintext bytes still expected"
                         } else {
-                            return Poll::Ready(Err(io::Error::new(
-                                io::ErrorKind::UnexpectedEof,
-                                "truncated encrypted frame",
-                            )));
-                        }
+                            "truncated encrypted frame"
+                        };
+                        return Poll::Ready(Err(io::Error::new(io::ErrorKind::UnexpectedEof, msg)));
                     }
                     this.frame_filled += n;
                 }
@@ -595,6 +600,85 @@ mod tests {
         let mut out = Vec::new();
         Box::pin(dec).read_to_end(&mut out).await.unwrap();
         assert_eq!(out, &pt[offset as usize..offset as usize + length as usize]);
+    }
+
+    #[tokio::test]
+    async fn full_read_exact_frame_multiple_succeeds() {
+        let key = test_key();
+        // Exactly 2 full frames — no partial trailing frame.
+        let pt: Vec<u8> = (0..FRAME_CHUNK_SIZE * 2).map(|i| (i % 256) as u8).collect();
+        let ct = encrypt_bytes(&pt, &key).await;
+        assert_eq!(ct.len(), pt.len() + 2 * 28);
+        let dec = decrypt_bytes(&ct, &key, pt.len() as u64).await;
+        assert_eq!(dec, pt);
+    }
+
+    #[tokio::test]
+    async fn truncation_at_frame_boundary_rejected() {
+        let key = test_key();
+        // Exactly 2 full frames of plaintext.
+        let pt: Vec<u8> = (0..FRAME_CHUNK_SIZE * 2).map(|i| (i % 256) as u8).collect();
+        let ct = encrypt_bytes(&pt, &key).await;
+
+        // Drop the entire second frame — EOF lands exactly on a frame
+        // boundary (frame_filled == 0), which must NOT be treated as a
+        // clean end-of-stream because more plaintext is expected.
+        let truncated = ct[..FRAME_CHUNK_SIZE + 28].to_vec();
+
+        let dec = FrameDecryptor::new(
+            Box::pin(std::io::Cursor::new(truncated)),
+            &key,
+            pt.len() as u64,
+            FRAME_CHUNK_SIZE,
+            no_aad(),
+        );
+        let mut out = Vec::new();
+        let err = Box::pin(dec).read_to_end(&mut out).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(err.to_string().contains("truncated encrypted stream"));
+    }
+
+    #[tokio::test]
+    async fn truncation_of_partial_trailing_frame_rejected() {
+        let key = test_key();
+        // 1.5 frames — last frame is partial; drop it entirely so EOF is
+        // again at an exact frame boundary.
+        let pt: Vec<u8> = (0..FRAME_CHUNK_SIZE + FRAME_CHUNK_SIZE / 2)
+            .map(|i| (i % 256) as u8)
+            .collect();
+        let ct = encrypt_bytes(&pt, &key).await;
+        let truncated = ct[..FRAME_CHUNK_SIZE + 28].to_vec();
+
+        let dec = FrameDecryptor::new(
+            Box::pin(std::io::Cursor::new(truncated)),
+            &key,
+            pt.len() as u64,
+            FRAME_CHUNK_SIZE,
+            no_aad(),
+        );
+        let mut out = Vec::new();
+        let err = Box::pin(dec).read_to_end(&mut out).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[tokio::test]
+    async fn truncation_mid_frame_rejected() {
+        let key = test_key();
+        let pt: Vec<u8> = (0..FRAME_CHUNK_SIZE * 2).map(|i| (i % 256) as u8).collect();
+        let ct = encrypt_bytes(&pt, &key).await;
+        // Cut in the middle of the second frame.
+        let truncated = ct[..ct.len() - 100].to_vec();
+
+        let dec = FrameDecryptor::new(
+            Box::pin(std::io::Cursor::new(truncated)),
+            &key,
+            pt.len() as u64,
+            FRAME_CHUNK_SIZE,
+            no_aad(),
+        );
+        let mut out = Vec::new();
+        let err = Box::pin(dec).read_to_end(&mut out).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[tokio::test]

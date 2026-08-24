@@ -63,12 +63,33 @@ impl ChecksumHasher {
     }
 }
 
+const KEY_LOCK_SHARDS: usize = 1024;
+const BUCKET_LOCK_SHARDS: usize = 256;
+
 pub struct FilesystemStorage {
     buckets_dir: PathBuf,
     erasure_coding: bool,
     chunk_size: u64,
     parity_shards: u32,
     keyring: Arc<Keyring>,
+    /// Sharded per-(bucket, key) mutexes. Serialize publish/delete/tag/version
+    /// mutations of one object so concurrent writers cannot tear a data file
+    /// from its sidecar. Sharded by hash — unrelated keys may share a shard,
+    /// which affects only latency, never correctness.
+    key_locks: Vec<tokio::sync::Mutex<()>>,
+    /// Sharded per-bucket RwLocks. Object writes take a read guard; DeleteBucket
+    /// and `.bucket.json` read-modify-write take a write guard. Lock order is
+    /// always bucket guard first, then key guard.
+    bucket_locks: Vec<tokio::sync::RwLock<()>>,
+}
+
+fn shard_index(parts: &[&str], shards: usize) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for p in parts {
+        p.hash(&mut h);
+    }
+    (h.finish() as usize) % shards
 }
 
 /// Validate that an object key does not contain path traversal components.
@@ -119,6 +140,7 @@ fn is_reserved_segment(name: &str) -> bool {
         || name == ".versions"
         || name == ".folder"
         || name.starts_with(".maxio-tmp-")
+        || name.starts_with(".maxio-bak-")
 }
 
 fn validate_upload_id(upload_id: &str) -> Result<(), StorageError> {
@@ -182,6 +204,27 @@ fn build_part_aad(upload_id: &str, part_number: u32, chunk_index: u64) -> Vec<u8
 fn part_aad_builder(upload_id: &str, part_number: u32) -> AadBuilder {
     let upload_id = upload_id.to_string();
     Arc::new(move |chunk_index: u64| build_part_aad(&upload_id, part_number, chunk_index))
+}
+
+/// Re-verify the bytes actually streamed out of a part file against the part's
+/// recorded size and MD5 ETag. Catches a torn or stale part file (e.g. from a
+/// crashed re-upload) before it is baked into a completed object whose
+/// composite ETag would otherwise still "match".
+fn verify_part_bytes(part: &PartMeta, bytes: u64, md5: Md5) -> Result<(), StorageError> {
+    if bytes != part.size {
+        return Err(StorageError::InvalidKey(format!(
+            "part {} size mismatch: expected {} bytes, read {}",
+            part.part_number, part.size, bytes
+        )));
+    }
+    let actual = format!("\"{}\"", hex::encode(md5.finalize()));
+    if actual != part.etag {
+        return Err(StorageError::InvalidKey(format!(
+            "part {} content does not match its etag — part file may be corrupt",
+            part.part_number
+        )));
+    }
+    Ok(())
 }
 
 /// Strip all mutable fields of `ObjectMeta` to produce the canonical input
@@ -293,7 +336,29 @@ impl FilesystemStorage {
             chunk_size,
             parity_shards,
             keyring,
+            key_locks: (0..KEY_LOCK_SHARDS).map(|_| Default::default()).collect(),
+            bucket_locks: (0..BUCKET_LOCK_SHARDS)
+                .map(|_| Default::default())
+                .collect(),
         })
+    }
+
+    async fn key_lock(&self, bucket: &str, key: &str) -> tokio::sync::MutexGuard<'_, ()> {
+        self.key_locks[shard_index(&[bucket, key], KEY_LOCK_SHARDS)]
+            .lock()
+            .await
+    }
+
+    async fn bucket_read(&self, bucket: &str) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        self.bucket_locks[shard_index(&[bucket], BUCKET_LOCK_SHARDS)]
+            .read()
+            .await
+    }
+
+    async fn bucket_write(&self, bucket: &str) -> tokio::sync::RwLockWriteGuard<'_, ()> {
+        self.bucket_locks[shard_index(&[bucket], BUCKET_LOCK_SHARDS)]
+            .write()
+            .await
     }
 
     // --- Bucket operations ---
@@ -305,11 +370,12 @@ impl FilesystemStorage {
             Ok(()) => {
                 let meta_path = bucket_dir.join(".bucket.json");
                 let json = serde_json::to_string_pretty(meta)?;
-                if let Err(e) = fs::write(&meta_path, json).await {
+                if let Err(e) = write_file_atomic(&meta_path, json.as_bytes()).await {
                     // Clean up the empty directory to avoid a half-created bucket
                     let _ = fs::remove_dir(&bucket_dir).await;
-                    return Err(e.into());
+                    return Err(e);
                 }
+                sync_parent_dir(&bucket_dir).await;
                 Ok(true)
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
@@ -324,6 +390,9 @@ impl FilesystemStorage {
 
     pub async fn delete_bucket(&self, name: &str) -> Result<bool, StorageError> {
         validate_bucket_name(name)?;
+        // Write lock: no object publish (which holds a read guard) can
+        // interleave between the emptiness check and the purge pass.
+        let _bucket_guard = self.bucket_write(name).await;
         let bucket_dir = self.buckets_dir.join(name);
         if !fs::try_exists(&bucket_dir).await? {
             return Ok(false);
@@ -360,6 +429,8 @@ impl FilesystemStorage {
                     || name == ".uploads"
                     || name == ".versions"
                     || name.ends_with(".meta.json")
+                    || name.starts_with(".maxio-tmp-")
+                    || name.starts_with(".maxio-bak-")
                 {
                     continue;
                 }
@@ -398,6 +469,8 @@ impl FilesystemStorage {
                     || name == ".uploads"
                     || name == ".versions"
                     || name.ends_with(".meta.json")
+                    || name.starts_with(".maxio-tmp-")
+                    || name.starts_with(".maxio-bak-")
                 {
                     if ft.is_dir() {
                         fs::remove_dir_all(&path).await?;
@@ -541,7 +614,7 @@ impl FilesystemStorage {
         }
 
         // Determine version_id up front so it can be folded into the AAD.
-        let versioned = self.is_versioned(bucket).await.unwrap_or(false);
+        let versioned = self.is_versioned(bucket).await?;
         let version_id = if versioned {
             Some(Self::generate_version_id())
         } else {
@@ -695,14 +768,43 @@ impl FilesystemStorage {
         let tmp_meta_path = temp_sibling_path(&meta_path);
         let mut tmp_meta_guard = TempPathGuard::file(tmp_meta_path.clone());
         fs::write(&tmp_meta_path, json).await?;
-        publish_temp_payload_and_meta(&tmp_obj_path, &obj_path, false, &tmp_meta_path, &meta_path)
-            .await?;
+
+        // Serialize the visible state change per key; the bucket read guard
+        // keeps DeleteBucket from interleaving with the publish.
+        let _bucket_guard = self.bucket_read(bucket).await;
+        let _key_guard = self.key_lock(bucket, key).await;
+        self.ensure_bucket_exists(bucket).await?;
+        let publish_result: Result<(), StorageError> = async {
+            if versioned {
+                // Snapshot BEFORE publish, from the temp file, so a concurrent
+                // or failed publish can never corrupt the version copy.
+                // Archive a pre-versioning ("null") current object instead of
+                // destroying it.
+                self.archive_null_version_if_needed(bucket, key).await?;
+                self.write_version(bucket, key, &meta, &tmp_obj_path).await?;
+            }
+            publish_temp_payload_and_meta(
+                &tmp_obj_path,
+                &obj_path,
+                false,
+                &tmp_meta_path,
+                &meta_path,
+            )
+            .await
+        }
+        .await;
+        if let Err(e) = publish_result {
+            if versioned {
+                self.rollback_failed_versioned_publish(bucket, key, version_id.as_deref())
+                    .await;
+            }
+            return Err(e);
+        }
         tmp_obj_guard.disarm();
         tmp_meta_guard.disarm();
-
-        if versioned {
-            self.write_version(bucket, key, &meta, &obj_path).await?;
-        }
+        // The same key may hold a stale EC payload from an earlier server
+        // config; reads resolve EC first, so drop it.
+        remove_dir_all_if_exists(&self.ec_dir(bucket, key)).await?;
 
         Ok(PutResult {
             size,
@@ -801,7 +903,7 @@ impl FilesystemStorage {
             plaintext_size: None,
         };
         let manifest_json = serde_json::to_string_pretty(&manifest)?;
-        fs::write(tmp_ec_dir.join("manifest.json"), manifest_json).await?;
+        write_file_atomic(&tmp_ec_dir.join("manifest.json"), manifest_json.as_bytes()).await?;
 
         let etag = hex::encode(md5_hasher.finalize());
         let etag_quoted = format!("\"{}\"", etag);
@@ -811,7 +913,7 @@ impl FilesystemStorage {
             .format("%Y-%m-%dT%H:%M:%S%.3fZ")
             .to_string();
 
-        let versioned = self.is_versioned(bucket).await.unwrap_or(false);
+        let versioned = self.is_versioned(bucket).await?;
         let version_id = if versioned {
             Some(Self::generate_version_id())
         } else {
@@ -846,14 +948,30 @@ impl FilesystemStorage {
         let tmp_meta_path = temp_sibling_path(&meta_path);
         let mut tmp_meta_guard = TempPathGuard::file(tmp_meta_path.clone());
         fs::write(&tmp_meta_path, serde_json::to_string_pretty(&meta)?).await?;
-        publish_temp_payload_and_meta(&tmp_ec_dir, &ec_dir, true, &tmp_meta_path, &meta_path)
-            .await?;
+
+        let _bucket_guard = self.bucket_read(bucket).await;
+        let _key_guard = self.key_lock(bucket, key).await;
+        self.ensure_bucket_exists(bucket).await?;
+        let publish_result: Result<(), StorageError> = async {
+            if versioned {
+                self.archive_null_version_if_needed(bucket, key).await?;
+                self.write_version_chunked(bucket, key, &meta, &tmp_ec_dir)
+                    .await?;
+            }
+            publish_temp_payload_and_meta(&tmp_ec_dir, &ec_dir, true, &tmp_meta_path, &meta_path)
+                .await
+        }
+        .await;
+        if let Err(e) = publish_result {
+            if versioned {
+                self.rollback_failed_versioned_publish(bucket, key, version_id.as_deref())
+                    .await;
+            }
+            return Err(e);
+        }
         tmp_ec_guard.disarm();
         tmp_meta_guard.disarm();
-
-        if versioned {
-            self.write_version_chunked(bucket, key, &meta).await?;
-        }
+        remove_file_if_exists(&self.object_path(bucket, key)).await?;
 
         Ok(PutResult {
             size: total_size,
@@ -889,7 +1007,7 @@ impl FilesystemStorage {
 
         // Version-id upfront: AAD binds to it, so we need it before the first
         // frame is encrypted.
-        let versioned = self.is_versioned(bucket).await.unwrap_or(false);
+        let versioned = self.is_versioned(bucket).await?;
         let version_id = if versioned {
             Some(Self::generate_version_id())
         } else {
@@ -1012,9 +1130,9 @@ impl FilesystemStorage {
             },
             plaintext_size: Some(plaintext_size),
         };
-        fs::write(
-            tmp_ec_dir.join("manifest.json"),
-            serde_json::to_string_pretty(&manifest)?,
+        write_file_atomic(
+            &tmp_ec_dir.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest)?.as_bytes(),
         )
         .await?;
 
@@ -1072,14 +1190,30 @@ impl FilesystemStorage {
         let tmp_meta_path = temp_sibling_path(&meta_path);
         let mut tmp_meta_guard = TempPathGuard::file(tmp_meta_path.clone());
         fs::write(&tmp_meta_path, serde_json::to_string_pretty(&meta)?).await?;
-        publish_temp_payload_and_meta(&tmp_ec_dir, &ec_dir, true, &tmp_meta_path, &meta_path)
-            .await?;
+
+        let _bucket_guard = self.bucket_read(bucket).await;
+        let _key_guard = self.key_lock(bucket, key).await;
+        self.ensure_bucket_exists(bucket).await?;
+        let publish_result: Result<(), StorageError> = async {
+            if versioned {
+                self.archive_null_version_if_needed(bucket, key).await?;
+                self.write_version_chunked(bucket, key, &meta, &tmp_ec_dir)
+                    .await?;
+            }
+            publish_temp_payload_and_meta(&tmp_ec_dir, &ec_dir, true, &tmp_meta_path, &meta_path)
+                .await
+        }
+        .await;
+        if let Err(e) = publish_result {
+            if versioned {
+                self.rollback_failed_versioned_publish(bucket, key, version_id.as_deref())
+                    .await;
+            }
+            return Err(e);
+        }
         tmp_ec_guard.disarm();
         tmp_meta_guard.disarm();
-
-        if versioned {
-            self.write_version_chunked(bucket, key, &meta).await?;
-        }
+        remove_file_if_exists(&self.object_path(bucket, key)).await?;
 
         Ok(PutResult {
             size: plaintext_size,
@@ -1171,7 +1305,7 @@ async fn write_chunk_file(path: &Path, index: u32, data: &[u8]) -> Result<ChunkI
     let sha256 = hex::encode(Sha256::digest(data));
     let mut file = fs::File::create(&path).await?;
     file.write_all(data).await?;
-    file.flush().await?;
+    file.sync_all().await?;
     Ok(ChunkInfo {
         index,
         size: data.len() as u64,
@@ -1183,6 +1317,90 @@ async fn write_chunk_file(path: &Path, index: u32, data: &[u8]) -> Result<ChunkI
 fn temp_sibling_path(path: &Path) -> PathBuf {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     parent.join(format!(".maxio-tmp-{}", uuid::Uuid::new_v4()))
+}
+
+/// Sibling backup path for `path` during a directory publish. The original
+/// file name is embedded so housekeeping can restore an orphaned backup after
+/// a crash (see `sweep_backup_files`).
+fn backup_sibling_path(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    parent.join(format!(".maxio-bak-{}", name))
+}
+
+/// Best-effort: set `path`'s mtime to now. Used to stamp publish backups so
+/// housekeeping's staleness gate works even though rename preserves mtime.
+async fn touch_now(path: &Path) {
+    let path = path.to_path_buf();
+    let res = tokio::task::spawn_blocking(move || {
+        let times = std::fs::FileTimes::new().set_modified(std::time::SystemTime::now());
+        std::fs::File::open(&path).and_then(|f| f.set_times(times))
+    })
+    .await;
+    match res {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!("failed to touch backup mtime: {}", e),
+        Err(e) => tracing::warn!("touch task failed: {}", e),
+    }
+}
+
+/// Fsync an already-written file so its bytes are on stable storage before the
+/// rename that publishes it. Without this, a power loss after the rename can
+/// leave a zero-length or truncated file behind a successful response.
+async fn sync_file(path: &Path) -> Result<(), StorageError> {
+    let f = fs::File::open(path).await?;
+    f.sync_all().await?;
+    Ok(())
+}
+
+/// Fsync the parent directory of `path` so a completed rename itself survives
+/// power loss. Best-effort: a failure is logged, not propagated, because the
+/// data blocks are already durable at this point.
+async fn sync_parent_dir(path: &Path) {
+    #[cfg(unix)]
+    {
+        if let Some(parent) = path.parent() {
+            let parent = parent.to_path_buf();
+            let res = tokio::task::spawn_blocking(move || {
+                std::fs::File::open(&parent).and_then(|f| f.sync_all())
+            })
+            .await;
+            match res {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!("directory fsync failed for {}: {}", path.display(), e)
+                }
+                Err(e) => tracing::warn!("directory fsync task failed: {}", e),
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
+/// Durable atomic write for small metadata files (sidecars, `.bucket.json`,
+/// version metadata, part metadata): temp sibling → fsync → rename over the
+/// final path → parent-dir fsync. Readers see either the old or the new
+/// complete file, never a torn one, and the result survives power loss.
+async fn write_file_atomic(path: &Path, bytes: &[u8]) -> Result<(), StorageError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    let tmp = temp_sibling_path(path);
+    let mut guard = TempPathGuard::file(tmp.clone());
+    let mut f = fs::File::create(&tmp).await?;
+    f.write_all(bytes).await?;
+    f.sync_all().await?;
+    drop(f);
+    fs::rename(&tmp, path).await?;
+    guard.disarm();
+    sync_parent_dir(path).await;
+    Ok(())
 }
 
 struct TempPathGuard {
@@ -1239,34 +1457,60 @@ async fn publish_temp_payload_and_meta(
         fs::create_dir_all(parent).await?;
     }
 
-    let payload_backup = backup_existing(final_payload).await?;
-    let meta_backup = backup_existing(final_meta).await?;
+    // Make the new bytes durable BEFORE they become visible. Directory
+    // payloads (EC) are synced chunk-by-chunk at write time.
+    if !payload_is_dir {
+        sync_file(tmp_payload).await?;
+    }
+    sync_file(tmp_meta).await?;
 
-    if let Err(e) = fs::rename(tmp_payload, final_payload).await {
-        restore_backup(final_meta, &meta_backup, false).await;
-        restore_backup(final_payload, &payload_backup, payload_is_dir).await;
-        return Err(StorageError::Io(e));
+    if payload_is_dir {
+        // rename(2) cannot replace a non-empty directory, so the old EC dir is
+        // moved aside first — under a name that encodes the original, so
+        // housekeeping can restore it if a crash strands the publish here.
+        let backup = if fs::try_exists(final_payload).await? {
+            let b = backup_sibling_path(final_payload);
+            remove_path_if_exists(&b, true).await;
+            fs::rename(final_payload, &b).await?;
+            // rename preserves the old dir's mtime; stamp the backup with NOW
+            // so housekeeping's age gate measures time-since-publish-started,
+            // not object age — otherwise the sweep could grab a live backup.
+            touch_now(&b).await;
+            Some(b)
+        } else {
+            None
+        };
+        if let Err(e) = fs::rename(tmp_payload, final_payload).await {
+            restore_backup(final_payload, &backup, true).await;
+            return Err(StorageError::Io(e));
+        }
+        if let Err(e) = fs::rename(tmp_meta, final_meta).await {
+            remove_path_if_exists(final_payload, true).await;
+            restore_backup(final_payload, &backup, true).await;
+            return Err(StorageError::Io(e));
+        }
+        cleanup_backup(&backup, true).await;
+    } else {
+        // Plain files: rename atomically replaces the destination, so the old
+        // object is never moved aside and can never be lost mid-publish.
+        fs::rename(tmp_payload, final_payload).await?;
+        if let Err(e) = fs::rename(tmp_meta, final_meta).await {
+            // Same-directory rename only fails if the filesystem itself is
+            // failing. The payload replace cannot be undone at this point, so
+            // surface the torn data/sidecar state loudly.
+            tracing::error!(
+                "sidecar rename failed AFTER payload publish for {}: data and metadata are out of sync",
+                final_payload.display()
+            );
+            return Err(StorageError::Io(e));
+        }
     }
 
-    if let Err(e) = fs::rename(tmp_meta, final_meta).await {
-        remove_path_if_exists(final_payload, payload_is_dir).await;
-        restore_backup(final_meta, &meta_backup, false).await;
-        restore_backup(final_payload, &payload_backup, payload_is_dir).await;
-        return Err(StorageError::Io(e));
+    sync_parent_dir(final_payload).await;
+    if final_meta.parent() != final_payload.parent() {
+        sync_parent_dir(final_meta).await;
     }
-
-    cleanup_backup(&payload_backup, payload_is_dir).await;
-    cleanup_backup(&meta_backup, false).await;
     Ok(())
-}
-
-async fn backup_existing(path: &Path) -> Result<Option<PathBuf>, StorageError> {
-    if !fs::try_exists(path).await? {
-        return Ok(None);
-    }
-    let backup = temp_sibling_path(path);
-    fs::rename(path, &backup).await?;
-    Ok(Some(backup))
 }
 
 async fn restore_backup(final_path: &Path, backup: &Option<PathBuf>, is_dir: bool) {
@@ -1306,7 +1550,7 @@ impl FilesystemStorage {
             fs::create_dir_all(parent).await?;
         }
         fs::create_dir_all(&tmp_ec_dir).await?;
-        let versioned = self.is_versioned(bucket).await.unwrap_or(false);
+        let versioned = self.is_versioned(bucket).await?;
         let version_id = if versioned {
             Some(Self::generate_version_id())
         } else {
@@ -1323,11 +1567,15 @@ impl FilesystemStorage {
         for part in selected {
             let mut part_file =
                 fs::File::open(self.part_path(bucket, upload_id, part.part_number)).await?;
+            let mut part_md5 = Md5::new();
+            let mut part_bytes: u64 = 0;
             loop {
                 let n = part_file.read(&mut buf).await?;
                 if n == 0 {
                     break;
                 }
+                part_md5.update(&buf[..n]);
+                part_bytes += n as u64;
                 total_size += n as u64;
                 chunk_buf.extend_from_slice(&buf[..n]);
 
@@ -1338,6 +1586,7 @@ impl FilesystemStorage {
                     chunk_index += 1;
                 }
             }
+            verify_part_bytes(part, part_bytes, part_md5)?;
 
             let raw_md5 = hex::decode(part.etag.trim_matches('"'))
                 .map_err(|_| StorageError::InvalidKey("invalid part etag".into()))?;
@@ -1384,9 +1633,9 @@ impl FilesystemStorage {
             },
             plaintext_size: None,
         };
-        fs::write(
-            tmp_ec_dir.join("manifest.json"),
-            serde_json::to_string_pretty(&manifest)?,
+        write_file_atomic(
+            &tmp_ec_dir.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest)?.as_bytes(),
         )
         .await?;
 
@@ -1452,15 +1701,39 @@ impl FilesystemStorage {
         let tmp_meta_path = temp_sibling_path(&meta_path);
         let mut tmp_meta_guard = TempPathGuard::file(tmp_meta_path.clone());
         fs::write(&tmp_meta_path, serde_json::to_string_pretty(&object_meta)?).await?;
-        publish_temp_payload_and_meta(&tmp_ec_dir, &ec_dir, true, &tmp_meta_path, &meta_path)
-            .await?;
+        let _bucket_guard = self.bucket_read(bucket).await;
+        let _key_guard = self.key_lock(bucket, key).await;
+        self.ensure_bucket_exists(bucket).await?;
+        let publish_result: Result<(), StorageError> = async {
+            if versioned {
+                self.archive_null_version_if_needed(bucket, key).await?;
+                self.write_version_chunked(bucket, key, &object_meta, &tmp_ec_dir)
+                    .await?;
+            }
+            publish_temp_payload_and_meta(&tmp_ec_dir, &ec_dir, true, &tmp_meta_path, &meta_path)
+                .await
+        }
+        .await;
+        if let Err(e) = publish_result {
+            if versioned {
+                self.rollback_failed_versioned_publish(bucket, key, version_id.as_deref())
+                    .await;
+            }
+            return Err(e);
+        }
         tmp_ec_guard.disarm();
         tmp_meta_guard.disarm();
-        if versioned {
-            self.write_version_chunked(bucket, key, &object_meta)
-                .await?;
+        remove_file_if_exists(&self.object_path(bucket, key)).await?;
+        drop(_key_guard);
+        drop(_bucket_guard);
+        // Best-effort: the object is already durably published. A racing
+        // Abort/housekeeping may have removed the upload dir — that must not
+        // turn a successful complete into an error.
+        if let Err(e) = fs::remove_dir_all(self.upload_dir(bucket, upload_id)).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("failed to clean up upload dir {}: {}", upload_id, e);
+            }
         }
-        fs::remove_dir_all(self.upload_dir(bucket, upload_id)).await?;
 
         Ok(PutResult {
             size: total_size,
@@ -1491,7 +1764,7 @@ impl FilesystemStorage {
             fs::create_dir_all(parent).await?;
         }
         fs::create_dir_all(&tmp_ec_dir).await?;
-        let versioned = self.is_versioned(bucket).await.unwrap_or(false);
+        let versioned = self.is_versioned(bucket).await?;
         let version_id = if versioned {
             Some(Self::generate_version_id())
         } else {
@@ -1556,11 +1829,15 @@ impl FilesystemStorage {
                 Box::pin(fs::File::open(&part_path).await?)
             };
 
+            let mut part_md5 = Md5::new();
+            let mut part_bytes: u64 = 0;
             loop {
                 let n = part_stream.read(&mut read_buf).await?;
                 if n == 0 {
                     break;
                 }
+                part_md5.update(&read_buf[..n]);
+                part_bytes += n as u64;
                 total_plaintext += n as u64;
                 frame_buf.extend_from_slice(&read_buf[..n]);
                 while frame_buf.len() >= FRAME_CHUNK_SIZE {
@@ -1585,6 +1862,7 @@ impl FilesystemStorage {
                     }
                 }
             }
+            verify_part_bytes(part, part_bytes, part_md5)?;
 
             let raw_md5 = hex::decode(part.etag.trim_matches('"'))
                 .map_err(|_| StorageError::InvalidKey("invalid part etag".into()))?;
@@ -1644,9 +1922,9 @@ impl FilesystemStorage {
             },
             plaintext_size: Some(total_plaintext),
         };
-        fs::write(
-            tmp_ec_dir.join("manifest.json"),
-            serde_json::to_string_pretty(&manifest)?,
+        write_file_atomic(
+            &tmp_ec_dir.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest)?.as_bytes(),
         )
         .await?;
 
@@ -1713,15 +1991,39 @@ impl FilesystemStorage {
         let tmp_meta_path = temp_sibling_path(&meta_path);
         let mut tmp_meta_guard = TempPathGuard::file(tmp_meta_path.clone());
         fs::write(&tmp_meta_path, serde_json::to_string_pretty(&object_meta)?).await?;
-        publish_temp_payload_and_meta(&tmp_ec_dir, &ec_dir, true, &tmp_meta_path, &meta_path)
-            .await?;
+        let _bucket_guard = self.bucket_read(bucket).await;
+        let _key_guard = self.key_lock(bucket, key).await;
+        self.ensure_bucket_exists(bucket).await?;
+        let publish_result: Result<(), StorageError> = async {
+            if versioned {
+                self.archive_null_version_if_needed(bucket, key).await?;
+                self.write_version_chunked(bucket, key, &object_meta, &tmp_ec_dir)
+                    .await?;
+            }
+            publish_temp_payload_and_meta(&tmp_ec_dir, &ec_dir, true, &tmp_meta_path, &meta_path)
+                .await
+        }
+        .await;
+        if let Err(e) = publish_result {
+            if versioned {
+                self.rollback_failed_versioned_publish(bucket, key, version_id.as_deref())
+                    .await;
+            }
+            return Err(e);
+        }
         tmp_ec_guard.disarm();
         tmp_meta_guard.disarm();
-        if versioned {
-            self.write_version_chunked(bucket, key, &object_meta)
-                .await?;
+        remove_file_if_exists(&self.object_path(bucket, key)).await?;
+        drop(_key_guard);
+        drop(_bucket_guard);
+        // Best-effort: the object is already durably published. A racing
+        // Abort/housekeeping may have removed the upload dir — that must not
+        // turn a successful complete into an error.
+        if let Err(e) = fs::remove_dir_all(self.upload_dir(bucket, upload_id)).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("failed to clean up upload dir {}: {}", upload_id, e);
+            }
         }
-        fs::remove_dir_all(self.upload_dir(bucket, upload_id)).await?;
 
         Ok(PutResult {
             size: total_plaintext,
@@ -1765,7 +2067,7 @@ impl FilesystemStorage {
 
         let meta_path = folder_dir.join(".folder.meta.json");
         let json = serde_json::to_string_pretty(&meta)?;
-        fs::write(&meta_path, json).await?;
+        write_file_atomic(&meta_path, json.as_bytes()).await?;
 
         Ok(PutResult {
             size: 0,
@@ -1784,6 +2086,11 @@ impl FilesystemStorage {
     ) -> Result<(ByteStream, ObjectMeta), StorageError> {
         validate_bucket_name(bucket)?;
         validate_key(key)?;
+        // Hold the key lock across the sidecar read + data-file open so the
+        // meta and the opened fd always describe the same object generation.
+        // The lock is released when this method returns; streaming continues
+        // on the already-open handle.
+        let _key_guard = self.key_lock(bucket, key).await;
         let meta = self.read_object_meta(bucket, key).await?;
         reject_sse_c_on_plaintext(&meta, customer_key.is_some())?;
         let ec_dir = self.ec_dir(bucket, key);
@@ -1863,6 +2170,11 @@ impl FilesystemStorage {
     ) -> Result<(ByteStream, ObjectMeta), StorageError> {
         validate_bucket_name(bucket)?;
         validate_key(key)?;
+        // Hold the key lock across the sidecar read + data-file open so the
+        // meta and the opened fd always describe the same object generation.
+        // The lock is released when this method returns; streaming continues
+        // on the already-open handle.
+        let _key_guard = self.key_lock(bucket, key).await;
         let meta = self.read_object_meta(bucket, key).await?;
         reject_sse_c_on_plaintext(&meta, customer_key.is_some())?;
         let ec_dir = self.ec_dir(bucket, key);
@@ -1975,19 +2287,24 @@ impl FilesystemStorage {
         tags: std::collections::HashMap<String, String>,
     ) -> Result<(), StorageError> {
         validate_key(key)?;
+        // Key lock: the sidecar rewrite must not interleave with a concurrent
+        // PUT/DELETE of the same key (stale-meta writeback would detach the
+        // sidecar from the data — fatal for encrypted objects).
+        let _key_guard = self.key_lock(bucket, key).await;
         let mut meta = self.read_object_meta(bucket, key).await?;
         meta.tags = if tags.is_empty() { None } else { Some(tags) };
         let json = serde_json::to_string_pretty(&meta)?;
-        fs::write(self.meta_path(bucket, key), json).await?;
+        write_file_atomic(&self.meta_path(bucket, key), json.as_bytes()).await?;
         Ok(())
     }
 
     pub async fn delete_object_tagging(&self, bucket: &str, key: &str) -> Result<(), StorageError> {
         validate_key(key)?;
+        let _key_guard = self.key_lock(bucket, key).await;
         let mut meta = self.read_object_meta(bucket, key).await?;
         meta.tags = None;
         let json = serde_json::to_string_pretty(&meta)?;
-        fs::write(self.meta_path(bucket, key), json).await?;
+        write_file_atomic(&self.meta_path(bucket, key), json.as_bytes()).await?;
         Ok(())
     }
 
@@ -1999,7 +2316,10 @@ impl FilesystemStorage {
         validate_bucket_name(bucket)?;
         validate_key(key)?;
 
-        let versioned = self.is_versioned(bucket).await.unwrap_or(false);
+        let _bucket_guard = self.bucket_read(bucket).await;
+        let _key_guard = self.key_lock(bucket, key).await;
+
+        let versioned = self.is_versioned(bucket).await?;
         if versioned {
             return self.write_delete_marker(bucket, key).await;
         }
@@ -2106,7 +2426,11 @@ impl FilesystemStorage {
         };
 
         let meta_json = serde_json::to_string_pretty(&meta)?;
-        fs::write(self.upload_meta_path(bucket, &upload_id), meta_json).await?;
+        write_file_atomic(
+            &self.upload_meta_path(bucket, &upload_id),
+            meta_json.as_bytes(),
+        )
+        .await?;
         Ok(meta)
     }
 
@@ -2133,16 +2457,14 @@ impl FilesystemStorage {
 
         let upload_meta = self.read_upload_meta(bucket, upload_id).await?;
         let (cipher_opt, nonce_prefix) = if let Some(ref spec) = upload_meta.encryption_spec {
-            let b64 = base64::engine::general_purpose::STANDARD;
             let dek = self.resolve_upload_dek(spec, customer_key)?;
-            let prefix_bytes = b64
-                .decode(&spec.upload_nonce_prefix)
-                .map_err(|_| StorageError::EncryptionError("invalid upload_nonce_prefix".into()))?;
-            if prefix_bytes.len() != 4 && prefix_bytes.len() != 8 {
-                return Err(StorageError::EncryptionError(
-                    "upload_nonce_prefix must be 4 or 8 bytes".into(),
-                ));
-            }
+            // Fresh random prefix PER UploadPart attempt: all parts share the
+            // upload DEK, so reusing one prefix across parts (or across
+            // retries of the same part number) would reuse AES-GCM nonces —
+            // a fatal keystream/auth-key leak. The decryptor reads each nonce
+            // from the frame header and validates only the frame index, so no
+            // metadata needs to carry this prefix.
+            let prefix_bytes = Keyring::generate_nonce_prefix8().to_vec();
             let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&dek));
             (Some(cipher), prefix_bytes)
         } else {
@@ -2150,7 +2472,9 @@ impl FilesystemStorage {
         };
 
         let part_path = self.part_path(bucket, upload_id, part_number);
-        let file = fs::File::create(&part_path).await?;
+        let tmp_part_path = temp_sibling_path(&part_path);
+        let mut tmp_part_guard = TempPathGuard::file(tmp_part_path.clone());
+        let file = fs::File::create(&tmp_part_path).await?;
         let mut writer = BufWriter::with_capacity(IO_BUFFER_SIZE, file);
         let mut hasher = Md5::new();
         let mut checksum_hasher = checksum
@@ -2206,13 +2530,13 @@ impl FilesystemStorage {
             }
         }
         writer.flush().await?;
+        writer.get_ref().sync_all().await?;
 
         // Validate and compute checksum
         let (checksum_algorithm, checksum_value) = if let Some((algo, expected)) = checksum {
             let computed = checksum_hasher.unwrap().finalize_base64();
             if let Some(expected_val) = expected {
                 if computed != expected_val {
-                    let _ = fs::remove_file(&part_path).await;
                     return Err(StorageError::ChecksumMismatch(format!(
                         "expected {}, got {}",
                         expected_val, computed
@@ -2226,7 +2550,7 @@ impl FilesystemStorage {
 
         let encrypted = cipher_opt.is_some();
         let ciphertext_size = if encrypted {
-            Some(fs::metadata(&part_path).await?.len())
+            Some(fs::metadata(&tmp_part_path).await?.len())
         } else {
             None
         };
@@ -2244,15 +2568,22 @@ impl FilesystemStorage {
             encrypted,
             ciphertext_size,
         };
-        if let Err(e) = fs::write(
-            self.part_meta_path(bucket, upload_id, part_number),
-            serde_json::to_string_pretty(&meta)?,
+        // Publish data, then sidecar — both atomic renames, so a retried part
+        // upload replaces the previous attempt wholesale and can never leave a
+        // truncated part behind a stale sidecar.
+        fs::rename(&tmp_part_path, &part_path).await?;
+        tmp_part_guard.disarm();
+        if let Err(e) = write_file_atomic(
+            &self.part_meta_path(bucket, upload_id, part_number),
+            serde_json::to_string_pretty(&meta)?.as_bytes(),
         )
         .await
         {
-            // Clean up orphaned part file on metadata write failure
+            // Remove both files so a stale sidecar from an earlier attempt
+            // cannot pair with this orphaned data file at Complete time.
             let _ = fs::remove_file(&part_path).await;
-            return Err(e.into());
+            let _ = fs::remove_file(self.part_meta_path(bucket, upload_id, part_number)).await;
+            return Err(e);
         }
         Ok(meta)
     }
@@ -2270,6 +2601,14 @@ impl FilesystemStorage {
             return Err(StorageError::InvalidKey(
                 "at least one part is required to complete upload".into(),
             ));
+        }
+
+        // AWS S3 semantics: part numbers must be strictly ascending — this
+        // also rejects duplicates, which would silently double bytes.
+        for pair in parts.windows(2) {
+            if pair[1].0 <= pair[0].0 {
+                return Err(StorageError::InvalidPartOrder);
+            }
         }
 
         let upload_meta = self.read_upload_meta(bucket, upload_id).await?;
@@ -2414,7 +2753,7 @@ impl FilesystemStorage {
             (None, Vec::new(), None)
         };
 
-        let versioned = self.is_versioned(bucket).await.unwrap_or(false);
+        let versioned = self.is_versioned(bucket).await?;
         let version_id = if versioned {
             Some(Self::generate_version_id())
         } else {
@@ -2457,11 +2796,15 @@ impl FilesystemStorage {
             } else {
                 Box::pin(fs::File::open(&part_path).await?)
             };
+            let mut part_md5 = Md5::new();
+            let mut part_bytes: u64 = 0;
             loop {
                 let n = part_stream.read(&mut buf).await?;
                 if n == 0 {
                     break;
                 }
+                part_md5.update(&buf[..n]);
+                part_bytes += n as u64;
                 total_size += n as u64;
                 if let Some(ref cipher) = cipher_opt {
                     frame_buf.extend_from_slice(&buf[..n]);
@@ -2488,6 +2831,7 @@ impl FilesystemStorage {
                     writer.write_all(&buf[..n]).await?;
                 }
             }
+            verify_part_bytes(part, part_bytes, part_md5)?;
 
             let raw_md5 = hex::decode(part.etag.trim_matches('"'))
                 .map_err(|_| StorageError::InvalidKey("invalid part etag".into()))?;
@@ -2576,15 +2920,50 @@ impl FilesystemStorage {
         let tmp_meta_path = temp_sibling_path(&meta_path);
         let mut tmp_meta_guard = TempPathGuard::file(tmp_meta_path.clone());
         fs::write(&tmp_meta_path, serde_json::to_string_pretty(&object_meta)?).await?;
-        publish_temp_payload_and_meta(&tmp_obj_path, &obj_path, false, &tmp_meta_path, &meta_path)
-            .await?;
+        let _bucket_guard = self.bucket_read(bucket).await;
+        let _key_guard = self.key_lock(bucket, &upload_meta.key).await;
+        self.ensure_bucket_exists(bucket).await?;
+        let publish_result: Result<(), StorageError> = async {
+            if versioned {
+                self.archive_null_version_if_needed(bucket, &upload_meta.key)
+                    .await?;
+                self.write_version(bucket, &upload_meta.key, &object_meta, &tmp_obj_path)
+                    .await?;
+            }
+            publish_temp_payload_and_meta(
+                &tmp_obj_path,
+                &obj_path,
+                false,
+                &tmp_meta_path,
+                &meta_path,
+            )
+            .await
+        }
+        .await;
+        if let Err(e) = publish_result {
+            if versioned {
+                self.rollback_failed_versioned_publish(
+                    bucket,
+                    &upload_meta.key,
+                    version_id.as_deref(),
+                )
+                .await;
+            }
+            return Err(e);
+        }
         tmp_obj_guard.disarm();
         tmp_meta_guard.disarm();
-        if versioned {
-            self.write_version(bucket, &upload_meta.key, &object_meta, &obj_path)
-                .await?;
+        remove_dir_all_if_exists(&self.ec_dir(bucket, &upload_meta.key)).await?;
+        drop(_key_guard);
+        drop(_bucket_guard);
+        // Best-effort: the object is already durably published. A racing
+        // Abort/housekeeping may have removed the upload dir — that must not
+        // turn a successful complete into an error.
+        if let Err(e) = fs::remove_dir_all(self.upload_dir(bucket, upload_id)).await {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!("failed to clean up upload dir {}: {}", upload_id, e);
+            }
         }
-        fs::remove_dir_all(self.upload_dir(bucket, upload_id)).await?;
 
         Ok(PutResult {
             size: total_size,
@@ -2697,13 +3076,25 @@ impl FilesystemStorage {
                         .and_then(|d| serde_json::from_str::<MultipartUploadMeta>(&d).ok())
                         .map(|m| m.initiated);
                     // Treat unreadable/missing meta as stale by directory mtime.
-                    let age_ok = match initiated {
+                    let mut age_ok = match initiated {
                         Some(ts) => chrono::DateTime::parse_from_rfc3339(&ts)
                             .map(|t| now.signed_duration_since(t.with_timezone(&chrono::Utc)))
                             .map(|age| age > stale_after)
                             .unwrap_or(true),
                         None => true,
                     };
+                    // A slow-but-alive upload keeps writing parts; recent part
+                    // activity vetoes removal so acked parts are never destroyed
+                    // under a client that is still uploading.
+                    if age_ok
+                        && !Self::entry_older_than(
+                            &up.path(),
+                            stale_after.num_seconds().max(0) as u64,
+                        )
+                        .await
+                    {
+                        age_ok = false;
+                    }
                     if age_ok {
                         match fs::remove_dir_all(up.path()).await {
                             Ok(()) => {
@@ -2723,46 +3114,133 @@ impl FilesystemStorage {
                 }
             }
 
-            // 2. Leftover temp files from crashed writes (bucket root level).
-            temp_removed += Self::sweep_temp_files(&bucket_dir).await;
-            temp_removed += Self::sweep_temp_files(&uploads_dir).await;
+            // 2. Leftover temp/backup files from crashed writes, at any depth.
+            temp_removed += Self::sweep_stale_artifacts(&bucket_dir).await;
         }
 
         (uploads_removed, temp_removed)
     }
 
-    /// Remove `.maxio-tmp-*` entries directly inside `dir`.
-    async fn sweep_temp_files(dir: &Path) -> u64 {
-        let mut removed = 0u64;
-        let mut entries = match fs::read_dir(dir).await {
-            Ok(e) => e,
-            Err(_) => return 0,
-        };
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if !name.starts_with(".maxio-tmp-") {
-                continue;
-            }
-            let path = entry.path();
-            let result = match entry.file_type().await {
-                Ok(ft) if ft.is_dir() => fs::remove_dir_all(&path).await,
-                _ => fs::remove_file(&path).await,
-            };
-            match result {
-                Ok(()) => {
-                    removed += 1;
-                    tracing::info!("housekeeping: removed leftover temp {}", path.display());
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "housekeeping: failed to remove temp {}: {}",
-                        path.display(),
-                        e
-                    )
-                }
-            }
+    /// True if `path`'s mtime is older than `secs` seconds. Errs on the side
+    /// of "not old" so nothing live is ever removed on a stat failure.
+    async fn entry_older_than(path: &Path, secs: u64) -> bool {
+        match fs::metadata(path).await.and_then(|m| m.modified()) {
+            Ok(mtime) => match mtime.elapsed() {
+                Ok(age) => age.as_secs() > secs,
+                Err(_) => false,
+            },
+            Err(_) => false,
         }
-        removed
+    }
+
+    /// Recursively sweep crash leftovers under `dir`:
+    /// * `.maxio-tmp-*` entries older than `TEMP_STALE_AFTER_SECS` are removed.
+    ///   The age gate matters: an in-flight upload keeps touching its temp
+    ///   file, so a young temp may belong to a live request and must be kept.
+    /// * `.maxio-bak-<name>` entries older than `BACKUP_STALE_AFTER_SECS` are
+    ///   crash-stranded EC publish backups: if `<name>` is missing the publish
+    ///   died mid-swap and the backup IS the committed object — restore it;
+    ///   if `<name>` exists the publish completed and the backup is garbage.
+    fn sweep_stale_artifacts(
+        dir: &Path,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = u64> + Send + '_>> {
+        const TEMP_STALE_AFTER_SECS: u64 = 24 * 3600;
+        const BACKUP_STALE_AFTER_SECS: u64 = 3600;
+        Box::pin(async move {
+            let mut removed = 0u64;
+            let mut entries = match fs::read_dir(dir).await {
+                Ok(e) => e,
+                Err(_) => return 0,
+            };
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let path = entry.path();
+                let is_dir = matches!(entry.file_type().await, Ok(ft) if ft.is_dir());
+
+                if let Some(orig_name) = name.strip_prefix(".maxio-bak-") {
+                    if orig_name.is_empty()
+                        || !Self::entry_older_than(&path, BACKUP_STALE_AFTER_SECS).await
+                    {
+                        continue;
+                    }
+                    let orig = dir.join(orig_name);
+                    // An `.ec` backup must not be restored over a key that has
+                    // since been rewritten as a flat object (reads resolve EC
+                    // first and would serve the stale shards).
+                    let superseded_by_flat = match orig_name.strip_suffix(".ec") {
+                        Some(flat) if !flat.is_empty() => {
+                            fs::try_exists(dir.join(flat)).await.unwrap_or(false)
+                        }
+                        _ => false,
+                    };
+                    if superseded_by_flat || fs::try_exists(&orig).await.unwrap_or(true) {
+                        let result = if is_dir {
+                            fs::remove_dir_all(&path).await
+                        } else {
+                            fs::remove_file(&path).await
+                        };
+                        match result {
+                            Ok(()) => {
+                                removed += 1;
+                                tracing::info!(
+                                    "housekeeping: removed stale backup {}",
+                                    path.display()
+                                );
+                            }
+                            Err(e) => tracing::warn!(
+                                "housekeeping: failed to remove backup {}: {}",
+                                path.display(),
+                                e
+                            ),
+                        }
+                    } else {
+                        match fs::rename(&path, &orig).await {
+                            Ok(()) => tracing::warn!(
+                                "housekeeping: restored {} from crash-stranded backup",
+                                orig.display()
+                            ),
+                            Err(e) => tracing::warn!(
+                                "housekeeping: failed to restore backup {}: {}",
+                                path.display(),
+                                e
+                            ),
+                        }
+                    }
+                    continue;
+                }
+
+                if name.starts_with(".maxio-tmp-") {
+                    if !Self::entry_older_than(&path, TEMP_STALE_AFTER_SECS).await {
+                        continue;
+                    }
+                    let result = if is_dir {
+                        fs::remove_dir_all(&path).await
+                    } else {
+                        fs::remove_file(&path).await
+                    };
+                    match result {
+                        Ok(()) => {
+                            removed += 1;
+                            tracing::info!(
+                                "housekeeping: removed leftover temp {}",
+                                path.display()
+                            );
+                        }
+                        Err(e) => tracing::warn!(
+                            "housekeeping: failed to remove temp {}: {}",
+                            path.display(),
+                            e
+                        ),
+                    }
+                    continue;
+                }
+
+                if is_dir {
+                    removed += Self::sweep_stale_artifacts(&path).await;
+                }
+            }
+            removed
+        })
     }
 
     // --- Internal helpers ---
@@ -2937,8 +3415,16 @@ impl FilesystemStorage {
         Ok(meta.versioning)
     }
 
-    pub async fn set_versioning(&self, bucket: &str, enabled: bool) -> Result<(), StorageError> {
+    /// Locked, atomic read-modify-write of `.bucket.json`. The bucket write
+    /// guard prevents lost updates from concurrent config changes; the atomic
+    /// file write prevents readers from ever seeing a torn config (which
+    /// would silently disable versioning protection).
+    async fn update_bucket_meta<F>(&self, bucket: &str, mutate: F) -> Result<(), StorageError>
+    where
+        F: FnOnce(&mut BucketMeta),
+    {
         validate_bucket_name(bucket)?;
+        let _bucket_guard = self.bucket_write(bucket).await;
         let meta_path = self.buckets_dir.join(bucket).join(".bucket.json");
         let data = fs::read_to_string(&meta_path).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -2948,14 +3434,16 @@ impl FilesystemStorage {
             }
         })?;
         let mut meta: BucketMeta = serde_json::from_str(&data)?;
-        let was_enabled = meta.versioning;
-        meta.versioning = enabled;
-        fs::write(&meta_path, serde_json::to_string_pretty(&meta)?).await?;
+        mutate(&mut meta);
+        write_file_atomic(&meta_path, serde_json::to_string_pretty(&meta)?.as_bytes()).await?;
+        Ok(())
+    }
 
+    pub async fn set_versioning(&self, bucket: &str, enabled: bool) -> Result<(), StorageError> {
         // S3-compatible suspension preserves historical versions. It only
         // changes how future writes/deletes are versioned.
-        let _ = was_enabled;
-        Ok(())
+        self.update_bucket_meta(bucket, |m| m.versioning = enabled)
+            .await
     }
 
     pub async fn get_bucket_public(&self, bucket: &str) -> Result<(bool, bool), StorageError> {
@@ -2978,20 +3466,11 @@ impl FilesystemStorage {
         read: bool,
         list: bool,
     ) -> Result<(), StorageError> {
-        validate_bucket_name(bucket)?;
-        let meta_path = self.buckets_dir.join(bucket).join(".bucket.json");
-        let data = fs::read_to_string(&meta_path).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                StorageError::NotFound(bucket.to_string())
-            } else {
-                StorageError::Io(e)
-            }
-        })?;
-        let mut meta: BucketMeta = serde_json::from_str(&data)?;
-        meta.public_read = read;
-        meta.public_list = list;
-        fs::write(&meta_path, serde_json::to_string_pretty(&meta)?).await?;
-        Ok(())
+        self.update_bucket_meta(bucket, |m| {
+            m.public_read = read;
+            m.public_list = list;
+        })
+        .await
     }
 
     pub async fn put_bucket_cors(
@@ -2999,19 +3478,8 @@ impl FilesystemStorage {
         bucket: &str,
         rules: Vec<crate::storage::CorsRule>,
     ) -> Result<(), StorageError> {
-        validate_bucket_name(bucket)?;
-        let meta_path = self.buckets_dir.join(bucket).join(".bucket.json");
-        let data = fs::read_to_string(&meta_path).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                StorageError::NotFound(bucket.to_string())
-            } else {
-                StorageError::Io(e)
-            }
-        })?;
-        let mut meta: BucketMeta = serde_json::from_str(&data)?;
-        meta.cors_rules = Some(rules);
-        fs::write(&meta_path, serde_json::to_string_pretty(&meta)?).await?;
-        Ok(())
+        self.update_bucket_meta(bucket, |m| m.cors_rules = Some(rules))
+            .await
     }
 
     pub async fn get_bucket_cors(
@@ -3032,19 +3500,7 @@ impl FilesystemStorage {
     }
 
     pub async fn delete_bucket_cors(&self, bucket: &str) -> Result<(), StorageError> {
-        validate_bucket_name(bucket)?;
-        let meta_path = self.buckets_dir.join(bucket).join(".bucket.json");
-        let data = fs::read_to_string(&meta_path).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                StorageError::NotFound(bucket.to_string())
-            } else {
-                StorageError::Io(e)
-            }
-        })?;
-        let mut meta: BucketMeta = serde_json::from_str(&data)?;
-        meta.cors_rules = None;
-        fs::write(&meta_path, serde_json::to_string_pretty(&meta)?).await?;
-        Ok(())
+        self.update_bucket_meta(bucket, |m| m.cors_rules = None).await
     }
 
     // --- Bucket default encryption ---
@@ -3054,19 +3510,8 @@ impl FilesystemStorage {
         bucket: &str,
         config: BucketEncryptionConfig,
     ) -> Result<(), StorageError> {
-        validate_bucket_name(bucket)?;
-        let meta_path = self.buckets_dir.join(bucket).join(".bucket.json");
-        let data = fs::read_to_string(&meta_path).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                StorageError::NotFound(bucket.to_string())
-            } else {
-                StorageError::Io(e)
-            }
-        })?;
-        let mut meta: BucketMeta = serde_json::from_str(&data)?;
-        meta.encryption_config = Some(config);
-        fs::write(&meta_path, serde_json::to_string_pretty(&meta)?).await?;
-        Ok(())
+        self.update_bucket_meta(bucket, |m| m.encryption_config = Some(config))
+            .await
     }
 
     pub async fn get_bucket_encryption(
@@ -3087,19 +3532,8 @@ impl FilesystemStorage {
     }
 
     pub async fn delete_bucket_encryption(&self, bucket: &str) -> Result<(), StorageError> {
-        validate_bucket_name(bucket)?;
-        let meta_path = self.buckets_dir.join(bucket).join(".bucket.json");
-        let data = fs::read_to_string(&meta_path).await.map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                StorageError::NotFound(bucket.to_string())
-            } else {
-                StorageError::Io(e)
-            }
-        })?;
-        let mut meta: BucketMeta = serde_json::from_str(&data)?;
-        meta.encryption_config = None;
-        fs::write(&meta_path, serde_json::to_string_pretty(&meta)?).await?;
-        Ok(())
+        self.update_bucket_meta(bucket, |m| m.encryption_config = None)
+            .await
     }
 
     // --- Encryption helpers ---
@@ -3297,7 +3731,92 @@ impl FilesystemStorage {
         }
     }
 
-    /// Write a new version to the `.versions/` directory and update the current (top-level) files.
+    /// Verify the bucket still exists. Called inside publish critical sections
+    /// so a racing DeleteBucket cannot strand a new object in a half-deleted
+    /// bucket (`create_dir_all` would silently resurrect the directory).
+    async fn ensure_bucket_exists(&self, bucket: &str) -> Result<(), StorageError> {
+        if !fs::try_exists(self.buckets_dir.join(bucket).join(".bucket.json")).await? {
+            return Err(StorageError::NotFound(bucket.to_string()));
+        }
+        Ok(())
+    }
+
+    /// If the current top-level object predates versioning (its sidecar has no
+    /// version_id), MOVE it into the version store as the "null" version
+    /// instead of destroying it on overwrite/delete. Matches S3: enabling
+    /// versioning must protect pre-existing data. The sidecar is stored
+    /// verbatim (version_id stays None) because the encryption AAD and sidecar
+    /// MAC are bound to the original identity. Caller must hold the key lock.
+    async fn archive_null_version_if_needed(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(), StorageError> {
+        let meta = match self.read_object_meta(bucket, key).await {
+            Ok(m) => m,
+            Err(StorageError::NotFound(_)) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        if meta.version_id.is_some() {
+            return Ok(()); // already tracked in the version store
+        }
+        let ver_dir = self.versions_dir(bucket, key);
+        fs::create_dir_all(&ver_dir).await?;
+        // Sidecar FIRST: if a crash interrupts the data move below, the
+        // archived null version is already addressable, so the bytes stay
+        // reachable via `?versionId=null` whichever side of the move they
+        // ended up on.
+        write_file_atomic(
+            &ver_dir.join("null.meta.json"),
+            serde_json::to_string_pretty(&meta)?.as_bytes(),
+        )
+        .await?;
+        let ec_dir = self.ec_dir(bucket, key);
+        if Self::is_chunked_path(&ec_dir).await {
+            let dst = ver_dir.join("null.ec");
+            remove_dir_all_if_exists(&dst).await?;
+            fs::rename(&ec_dir, &dst).await?;
+        } else {
+            let obj_path = self.object_path(bucket, key);
+            if fs::try_exists(&obj_path).await? {
+                fs::rename(&obj_path, ver_dir.join("null.data")).await?;
+            }
+        }
+        let _ = fs::remove_file(self.meta_path(bucket, key)).await;
+        Ok(())
+    }
+
+    /// Roll back after a failed versioned publish: drop any phantom version
+    /// files written for the failed PUT, then re-promote the newest intact
+    /// version (possibly the just-archived null version) to current so a
+    /// failed overwrite never leaves the object 404ing. Best-effort — the
+    /// original error is what the caller returns. Caller must hold the key
+    /// lock.
+    async fn rollback_failed_versioned_publish(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+    ) {
+        if let Some(vid) = version_id {
+            let ver_dir = self.versions_dir(bucket, key);
+            let _ = fs::remove_file(ver_dir.join(format!("{}.data", vid))).await;
+            let _ = fs::remove_file(ver_dir.join(format!("{}.meta.json", vid))).await;
+            let _ = fs::remove_dir_all(ver_dir.join(format!("{}.ec", vid))).await;
+        }
+        if let Err(e) = self.update_current_version(bucket, key).await {
+            tracing::warn!(
+                "failed to restore current version of {}/{} after failed publish: {}",
+                bucket,
+                key,
+                e
+            );
+        }
+    }
+
+    /// Write a new version to the `.versions/` directory. `data_path` is the
+    /// not-yet-published temp payload, so the snapshot can never race a
+    /// concurrent overwrite of the live path. Caller must hold the key lock.
     async fn write_version(
         &self,
         bucket: &str,
@@ -3309,51 +3828,56 @@ impl FilesystemStorage {
         let ver_dir = self.versions_dir(bucket, key);
         fs::create_dir_all(&ver_dir).await?;
 
-        // Copy data to version store
+        // Copy data to version store, durably.
         let ver_data = ver_dir.join(format!("{}.data", version_id));
         fs::copy(data_path, &ver_data).await?;
+        sync_file(&ver_data).await?;
 
-        // Write version metadata
+        // Write version metadata (atomic: a crash can leave an orphan .data
+        // file, but never a torn sidecar).
         let ver_meta = ver_dir.join(format!("{}.meta.json", version_id));
-        fs::write(&ver_meta, serde_json::to_string_pretty(meta)?).await?;
+        write_file_atomic(&ver_meta, serde_json::to_string_pretty(meta)?.as_bytes()).await?;
 
         Ok(())
     }
 
-    /// Write a new chunked version: copy .ec/ dir to .versions/{key}/{version_id}.ec/
+    /// Write a new chunked version by copying `src_ec` (the not-yet-published
+    /// temp EC dir) to `.versions/{key}/{version_id}.ec/`.
     async fn write_version_chunked(
         &self,
         bucket: &str,
         key: &str,
         meta: &ObjectMeta,
+        src_ec: &Path,
     ) -> Result<(), StorageError> {
         let version_id = meta.version_id.as_ref().unwrap();
         let ver_dir = self.versions_dir(bucket, key);
         fs::create_dir_all(&ver_dir).await?;
 
-        // Copy the entire .ec/ directory
-        let src_ec = self.ec_dir(bucket, key);
         let dst_ec = ver_dir.join(format!("{}.ec", version_id));
         fs::create_dir_all(&dst_ec).await?;
-        let mut entries = fs::read_dir(&src_ec).await?;
+        let mut entries = fs::read_dir(src_ec).await?;
         while let Some(entry) = entries.next_entry().await? {
             let dest = dst_ec.join(entry.file_name());
             fs::copy(entry.path(), &dest).await?;
+            sync_file(&dest).await?;
         }
 
-        // Write version metadata
         let ver_meta = ver_dir.join(format!("{}.meta.json", version_id));
-        fs::write(&ver_meta, serde_json::to_string_pretty(meta)?).await?;
+        write_file_atomic(&ver_meta, serde_json::to_string_pretty(meta)?.as_bytes()).await?;
 
         Ok(())
     }
 
     /// Write a delete marker version and remove the top-level files.
+    /// Caller must hold the key lock.
     async fn write_delete_marker(
         &self,
         bucket: &str,
         key: &str,
     ) -> Result<DeleteResult, StorageError> {
+        // Protect a pre-versioning object before the top-level files go away.
+        self.archive_null_version_if_needed(bucket, key).await?;
         let version_id = Self::generate_version_id();
         let now = chrono::Utc::now()
             .format("%Y-%m-%dT%H:%M:%S%.3fZ")
@@ -3378,9 +3902,14 @@ impl FilesystemStorage {
         let ver_dir = self.versions_dir(bucket, key);
         fs::create_dir_all(&ver_dir).await?;
         let ver_meta_path = ver_dir.join(format!("{}.meta.json", version_id));
-        fs::write(&ver_meta_path, serde_json::to_string_pretty(&marker_meta)?).await?;
+        write_file_atomic(
+            &ver_meta_path,
+            serde_json::to_string_pretty(&marker_meta)?.as_bytes(),
+        )
+        .await?;
 
-        // Remove top-level current files
+        // Remove top-level current files (the pre-versioning object, if any,
+        // was already archived as the "null" version above).
         let _ = fs::remove_file(self.object_path(bucket, key)).await;
         let _ = fs::remove_file(self.meta_path(bucket, key)).await;
         let _ = fs::remove_dir_all(self.ec_dir(bucket, key)).await;
@@ -3391,63 +3920,105 @@ impl FilesystemStorage {
         })
     }
 
-    /// Scan versions for a key and update the top-level files to reflect the latest non-delete-marker.
+    /// Scan versions for a key and update the top-level files to reflect the
+    /// latest non-delete-marker version. Caller must hold the key lock.
     async fn update_current_version(&self, bucket: &str, key: &str) -> Result<(), StorageError> {
         let ver_dir = self.versions_dir(bucket, key);
         if !fs::try_exists(&ver_dir).await.unwrap_or(false) {
             return Ok(());
         }
 
-        // Find the latest non-delete-marker version (lexicographic sort = chronological)
-        let mut versions = Vec::new();
+        // Collect version ids (sidecar filenames minus suffix). Timestamped
+        // ids sort chronologically; the archived "null" version is by
+        // definition the oldest.
+        let mut version_ids = Vec::new();
         let mut entries = fs::read_dir(&ver_dir).await?;
         while let Some(entry) = entries.next_entry().await? {
             let fname = entry.file_name().to_string_lossy().to_string();
-            if fname.ends_with(".meta.json") {
-                versions.push(fname);
+            if let Some(vid) = fname.strip_suffix(".meta.json") {
+                version_ids.push(vid.to_string());
             }
         }
-        versions.sort();
-        versions.reverse(); // newest first
+        version_ids.sort_by(|a, b| match (a.as_str() == "null", b.as_str() == "null") {
+            (true, false) => std::cmp::Ordering::Greater, // null last (oldest)
+            (false, true) => std::cmp::Ordering::Less,
+            _ => b.cmp(a), // newest first
+        });
 
-        for meta_fname in &versions {
-            let meta_path = ver_dir.join(meta_fname);
-            let data = fs::read_to_string(&meta_path).await?;
-            let meta: ObjectMeta = serde_json::from_str(&data)?;
-            if !meta.is_delete_marker {
-                // Restore this version as current
-                let vid = meta.version_id.as_ref().unwrap();
-                let obj_meta_path = self.meta_path(bucket, key);
-
-                let ver_ec = ver_dir.join(format!("{}.ec", vid));
-                if ver_ec.is_dir() {
-                    // Restore chunked version
-                    let dst_ec = self.ec_dir(bucket, key);
-                    if let Some(parent) = dst_ec.parent() {
-                        fs::create_dir_all(parent).await?;
+        for vid in &version_ids {
+            let meta_path = ver_dir.join(format!("{}.meta.json", vid));
+            // A corrupt or unreadable version sidecar must not block recovery
+            // of older, intact versions.
+            let meta: ObjectMeta = match fs::read_to_string(&meta_path).await {
+                Ok(data) => match serde_json::from_str(&data) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        tracing::warn!(
+                            "skipping corrupt version sidecar {}: {}",
+                            meta_path.display(),
+                            e
+                        );
+                        continue;
                     }
-                    let _ = fs::remove_dir_all(&dst_ec).await;
-                    fs::create_dir_all(&dst_ec).await?;
-                    let mut entries = fs::read_dir(&ver_ec).await?;
-                    while let Some(entry) = entries.next_entry().await? {
-                        fs::copy(entry.path(), dst_ec.join(entry.file_name())).await?;
-                    }
-                } else {
-                    // Restore flat version
-                    let ver_data = ver_dir.join(format!("{}.data", vid));
-                    let obj_path = self.object_path(bucket, key);
-                    if let Some(parent) = obj_path.parent() {
-                        fs::create_dir_all(parent).await?;
-                    }
-                    fs::copy(&ver_data, &obj_path).await?;
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        "skipping unreadable version sidecar {}: {}",
+                        meta_path.display(),
+                        e
+                    );
+                    continue;
                 }
-
-                if let Some(parent) = obj_meta_path.parent() {
-                    fs::create_dir_all(parent).await?;
-                }
-                fs::write(&obj_meta_path, serde_json::to_string_pretty(&meta)?).await?;
-                return Ok(());
+            };
+            if meta.is_delete_marker {
+                continue;
             }
+
+            // Restore this version as current, via the same atomic + durable
+            // publish path as a regular PUT.
+            let obj_meta_path = self.meta_path(bucket, key);
+            let tmp_meta = temp_sibling_path(&obj_meta_path);
+            let mut tmp_meta_guard = TempPathGuard::file(tmp_meta.clone());
+            fs::write(&tmp_meta, serde_json::to_string_pretty(&meta)?).await?;
+
+            let ver_ec = ver_dir.join(format!("{}.ec", vid));
+            if ver_ec.is_dir() {
+                let dst_ec = self.ec_dir(bucket, key);
+                let tmp_ec = temp_sibling_path(&dst_ec);
+                let mut tmp_ec_guard = TempPathGuard::dir(tmp_ec.clone());
+                fs::create_dir_all(&tmp_ec).await?;
+                let mut ec_entries = fs::read_dir(&ver_ec).await?;
+                while let Some(entry) = ec_entries.next_entry().await? {
+                    let dest = tmp_ec.join(entry.file_name());
+                    fs::copy(entry.path(), &dest).await?;
+                    sync_file(&dest).await?;
+                }
+                publish_temp_payload_and_meta(&tmp_ec, &dst_ec, true, &tmp_meta, &obj_meta_path)
+                    .await?;
+                tmp_ec_guard.disarm();
+                tmp_meta_guard.disarm();
+                remove_file_if_exists(&self.object_path(bucket, key)).await?;
+            } else {
+                let ver_data = ver_dir.join(format!("{}.data", vid));
+                let obj_path = self.object_path(bucket, key);
+                let tmp_data = temp_sibling_path(&obj_path);
+                let mut tmp_data_guard = TempPathGuard::file(tmp_data.clone());
+                fs::copy(&ver_data, &tmp_data).await?;
+                publish_temp_payload_and_meta(&tmp_data, &obj_path, false, &tmp_meta, &obj_meta_path)
+                    .await?;
+                tmp_data_guard.disarm();
+                tmp_meta_guard.disarm();
+                remove_dir_all_if_exists(&self.ec_dir(bucket, key)).await?;
+            }
+
+            if vid == "null" {
+                // The null version lives at the top level again; drop the
+                // archived copy so it cannot be listed twice.
+                let _ = fs::remove_file(ver_dir.join("null.data")).await;
+                let _ = fs::remove_dir_all(ver_dir.join("null.ec")).await;
+                let _ = fs::remove_file(ver_dir.join("null.meta.json")).await;
+            }
+            return Ok(());
         }
 
         // All versions are delete markers — remove top-level files
@@ -3466,8 +4037,15 @@ impl FilesystemStorage {
     ) -> Result<(ByteStream, ObjectMeta), StorageError> {
         validate_bucket_name(bucket)?;
         validate_key(key)?;
-        if version_id == "null" {
-            return self.get_object(bucket, key, customer_key).await;
+        if version_id == "null"
+            && !fs::try_exists(self.version_meta_path(bucket, key, "null")).await?
+        {
+            // No archived null version — the current object must be it.
+            let (stream, meta) = self.get_object(bucket, key, customer_key).await?;
+            if meta.version_id.is_some() {
+                return Err(StorageError::VersionNotFound("null".into()));
+            }
+            return Ok((stream, meta));
         }
         let ver_meta_path = self.version_meta_path(bucket, key, version_id);
         let data = fs::read_to_string(&ver_meta_path).await.map_err(|e| {
@@ -3567,8 +4145,14 @@ impl FilesystemStorage {
     ) -> Result<ObjectMeta, StorageError> {
         validate_bucket_name(bucket)?;
         validate_key(key)?;
-        if version_id == "null" {
-            return self.head_object(bucket, key).await;
+        if version_id == "null"
+            && !fs::try_exists(self.version_meta_path(bucket, key, "null")).await?
+        {
+            let meta = self.head_object(bucket, key).await?;
+            if meta.version_id.is_some() {
+                return Err(StorageError::VersionNotFound("null".into()));
+            }
+            return Ok(meta);
         }
         let ver_meta_path = self.version_meta_path(bucket, key, version_id);
         let data = fs::read_to_string(&ver_meta_path).await.map_err(|e| {
@@ -3593,8 +4177,24 @@ impl FilesystemStorage {
     ) -> Result<ObjectMeta, StorageError> {
         validate_bucket_name(bucket)?;
         validate_key(key)?;
+        let _bucket_guard = self.bucket_read(bucket).await;
+        let _key_guard = self.key_lock(bucket, key).await;
         if version_id == "null" {
+            let null_meta_path = self.version_meta_path(bucket, key, "null");
+            if fs::try_exists(&null_meta_path).await? {
+                // Archived null version: remove it from the store only — the
+                // top-level object is a different (newer) version.
+                let data = fs::read_to_string(&null_meta_path).await?;
+                let meta: ObjectMeta = serde_json::from_str(&data)?;
+                let _ = fs::remove_file(&null_meta_path).await;
+                let _ = fs::remove_file(self.version_data_path(bucket, key, "null")).await;
+                let _ = fs::remove_dir_all(self.versions_dir(bucket, key).join("null.ec")).await;
+                return Ok(meta);
+            }
             let meta = self.read_object_meta(bucket, key).await?;
+            if meta.version_id.is_some() {
+                return Err(StorageError::VersionNotFound("null".into()));
+            }
             remove_file_if_exists(&self.object_path(bucket, key)).await?;
             remove_file_if_exists(&self.meta_path(bucket, key)).await?;
             remove_dir_all_if_exists(&self.ec_dir(bucket, key)).await?;

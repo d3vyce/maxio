@@ -273,6 +273,7 @@ pub(super) fn map_storage_err(err: StorageError) -> S3Error {
     match err {
         StorageError::ChecksumMismatch(_) => S3Error::bad_checksum("x-amz-checksum"),
         StorageError::UploadNotFound(upload_id) => S3Error::no_such_upload(&upload_id),
+        StorageError::InvalidPartOrder => S3Error::invalid_part_order(),
         StorageError::InvalidKey(msg) if msg.contains("part too small") => {
             S3Error::entity_too_small()
         }

@@ -20,6 +20,7 @@ pub enum S3ErrorCode {
     InvalidArgument,
     InvalidBucketName,
     InvalidPart,
+    InvalidPartOrder,
     MalformedXML,
     NoSuchBucket,
     NoSuchKey,
@@ -48,6 +49,7 @@ impl S3ErrorCode {
             Self::InvalidArgument => "InvalidArgument",
             Self::InvalidBucketName => "InvalidBucketName",
             Self::InvalidPart => "InvalidPart",
+            Self::InvalidPartOrder => "InvalidPartOrder",
             Self::MalformedXML => "MalformedXML",
             Self::NoSuchBucket => "NoSuchBucket",
             Self::NoSuchKey => "NoSuchKey",
@@ -189,6 +191,14 @@ impl S3Error {
         Self {
             code: S3ErrorCode::InvalidPart,
             message: msg.to_string(),
+            resource: None,
+        }
+    }
+
+    pub fn invalid_part_order() -> Self {
+        Self {
+            code: S3ErrorCode::InvalidPartOrder,
+            message: "The list of parts was not in ascending order. Parts must be ordered by part number.".into(),
             resource: None,
         }
     }

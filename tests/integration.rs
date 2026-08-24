@@ -5937,26 +5937,31 @@ async fn test_sse_s3_cross_version_ciphertext_swap_rejected() {
     let b_bytes = std::fs::read(&ver_b_data).unwrap();
     std::fs::write(&ver_a_data, &b_bytes).unwrap();
 
-    let get = s3_request(
+    // Depending on timing the server may abort the connection before OR after
+    // the response headers, so a transport-level send error is itself a valid
+    // rejection. Only when a response arrives do we inspect the bytes.
+    let get = s3_request_result(
         "GET",
         &format!("{}/ver-swap/k.bin?versionId={}", base_url, vid_a),
         vec![],
     )
     .await;
-    // Decryptor fails mid-stream on AAD mismatch; assertion: bytes returned
-    // do NOT equal plaintext_a (the attacker's goal was to substitute B's data
-    // for A's without detection).
-    let body = get.bytes().await.unwrap_or_default();
-    assert_ne!(
-        body.as_ref(),
-        plaintext_a.as_slice(),
-        "cross-version ciphertext swap must not authenticate"
-    );
-    assert_ne!(
-        body.as_ref(),
-        plaintext_b.as_slice(),
-        "cross-version swap must not yield B's plaintext either"
-    );
+    if let Ok(resp) = get {
+        // Decryptor fails mid-stream on AAD mismatch; assertion: bytes returned
+        // do NOT equal plaintext_a (the attacker's goal was to substitute B's
+        // data for A's without detection).
+        let body = resp.bytes().await.unwrap_or_default();
+        assert_ne!(
+            body.as_ref(),
+            plaintext_a.as_slice(),
+            "cross-version ciphertext swap must not authenticate"
+        );
+        assert_ne!(
+            body.as_ref(),
+            plaintext_b.as_slice(),
+            "cross-version swap must not yield B's plaintext either"
+        );
+    }
 }
 
 /// 0-byte SSE-S3 object: PUT + GET round-trip. Sidecar MAC + AAD path must
@@ -6901,4 +6906,485 @@ async fn test_ec_plus_encryption_chunk_swap_rejected() {
             );
         }
     }
+}
+
+// --- Data-safety regression tests (stable-release hardening) ---
+
+fn test_bucket_meta(name: &str) -> maxio::storage::BucketMeta {
+    maxio::storage::BucketMeta {
+        name: name.to_string(),
+        created_at: "2026-01-01T00:00:00.000Z".to_string(),
+        region: "us-east-1".to_string(),
+        versioning: false,
+        cors_rules: None,
+        encryption_config: None,
+        public_read: false,
+        public_list: false,
+    }
+}
+
+/// Enabling versioning must protect the pre-versioning object: an overwrite
+/// must archive it as the "null" version instead of destroying it.
+#[tokio::test]
+async fn test_null_version_preserved_on_overwrite() {
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/nullver", base_url), vec![]).await;
+
+    let original = b"pre-versioning content".to_vec();
+    let put = s3_request(
+        "PUT",
+        &format!("{}/nullver/doc.txt", base_url),
+        original.clone(),
+    )
+    .await;
+    assert_eq!(put.status(), 200);
+
+    let vxml = b"<?xml version=\"1.0\"?><VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec();
+    s3_request("PUT", &format!("{}/nullver?versioning", base_url), vxml).await;
+
+    let put2 = s3_request(
+        "PUT",
+        &format!("{}/nullver/doc.txt", base_url),
+        b"new versioned content".to_vec(),
+    )
+    .await;
+    assert_eq!(put2.status(), 200);
+
+    // Current object is the new content.
+    let get = s3_request("GET", &format!("{}/nullver/doc.txt", base_url), vec![]).await;
+    assert_eq!(get.bytes().await.unwrap().as_ref(), b"new versioned content");
+
+    // The pre-versioning object must still be retrievable as version "null".
+    let get_null = s3_request(
+        "GET",
+        &format!("{}/nullver/doc.txt?versionId=null", base_url),
+        vec![],
+    )
+    .await;
+    assert_eq!(get_null.status(), 200, "null version must be preserved");
+    assert_eq!(get_null.bytes().await.unwrap().as_ref(), original.as_slice());
+}
+
+/// Deleting the newest version must fall back to the archived null version,
+/// restoring the pre-versioning object as current.
+#[tokio::test]
+async fn test_null_version_restored_after_newest_version_deleted() {
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/nullrestore", base_url), vec![]).await;
+
+    let original = b"original null-version bytes".to_vec();
+    s3_request(
+        "PUT",
+        &format!("{}/nullrestore/doc.txt", base_url),
+        original.clone(),
+    )
+    .await;
+
+    let vxml = b"<?xml version=\"1.0\"?><VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec();
+    s3_request("PUT", &format!("{}/nullrestore?versioning", base_url), vxml).await;
+
+    let put2 = s3_request(
+        "PUT",
+        &format!("{}/nullrestore/doc.txt", base_url),
+        b"v2 bytes".to_vec(),
+    )
+    .await;
+    let vid2 = put2
+        .headers()
+        .get("x-amz-version-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let del = s3_request(
+        "DELETE",
+        &format!("{}/nullrestore/doc.txt?versionId={}", base_url, vid2),
+        vec![],
+    )
+    .await;
+    assert!(del.status().is_success(), "delete of v2 failed: {}", del.status());
+
+    // The null version must be promoted back to current.
+    let get = s3_request("GET", &format!("{}/nullrestore/doc.txt", base_url), vec![]).await;
+    assert_eq!(get.status(), 200, "null version must be restored as current");
+    assert_eq!(get.bytes().await.unwrap().as_ref(), original.as_slice());
+}
+
+/// Deleting a versioned object (delete marker) must preserve the
+/// pre-versioning object as the retrievable "null" version.
+#[tokio::test]
+async fn test_null_version_preserved_on_delete_marker() {
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/nulldel", base_url), vec![]).await;
+
+    let original = b"protect me".to_vec();
+    s3_request(
+        "PUT",
+        &format!("{}/nulldel/doc.txt", base_url),
+        original.clone(),
+    )
+    .await;
+
+    let vxml = b"<?xml version=\"1.0\"?><VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec();
+    s3_request("PUT", &format!("{}/nulldel?versioning", base_url), vxml).await;
+
+    // Simple delete → delete marker.
+    let del = s3_request("DELETE", &format!("{}/nulldel/doc.txt", base_url), vec![]).await;
+    assert!(del.status().is_success());
+
+    // Current GET is a 404 (delete marker) ...
+    let get = s3_request("GET", &format!("{}/nulldel/doc.txt", base_url), vec![]).await;
+    assert_eq!(get.status(), 404);
+
+    // ... but the null version still holds the data.
+    let get_null = s3_request(
+        "GET",
+        &format!("{}/nulldel/doc.txt?versionId=null", base_url),
+        vec![],
+    )
+    .await;
+    assert_eq!(get_null.status(), 200, "delete marker must not destroy the null version");
+    assert_eq!(get_null.bytes().await.unwrap().as_ref(), original.as_slice());
+}
+
+/// CompleteMultipartUpload with parts out of ascending order must be rejected
+/// with InvalidPartOrder, like AWS S3 — not concatenated in client order.
+#[tokio::test]
+async fn test_multipart_invalid_part_order_rejected() {
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/mybucket", base_url), vec![]).await;
+    let create = s3_request(
+        "POST",
+        &format!("{}/mybucket/order.bin?uploads=", base_url),
+        vec![],
+    )
+    .await;
+    let upload_id = extract_xml_tag(&create.text().await.unwrap(), "UploadId").unwrap();
+
+    let p1 = vec![b'a'; 5 * 1024 * 1024];
+    let p2 = b"tail".to_vec();
+    let e1 = s3_request(
+        "PUT",
+        &format!(
+            "{}/mybucket/order.bin?partNumber=1&uploadId={}",
+            base_url, upload_id
+        ),
+        p1,
+    )
+    .await
+    .headers()
+    .get("etag")
+    .unwrap()
+    .to_str()
+    .unwrap()
+    .to_string();
+    let e2 = s3_request(
+        "PUT",
+        &format!(
+            "{}/mybucket/order.bin?partNumber=2&uploadId={}",
+            base_url, upload_id
+        ),
+        p2,
+    )
+    .await
+    .headers()
+    .get("etag")
+    .unwrap()
+    .to_str()
+    .unwrap()
+    .to_string();
+
+    // Parts listed as 2, 1 — must be rejected.
+    let complete_xml = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>2</PartNumber><ETag>{}</ETag></Part><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+        e2, e1
+    );
+    let complete = s3_request(
+        "POST",
+        &format!("{}/mybucket/order.bin?uploadId={}", base_url, upload_id),
+        complete_xml.into_bytes(),
+    )
+    .await;
+    assert_eq!(complete.status(), 400);
+    let body = complete.text().await.unwrap();
+    assert!(
+        body.contains("InvalidPartOrder"),
+        "expected InvalidPartOrder, got: {}",
+        body
+    );
+
+    // Duplicate part numbers must be rejected too.
+    let dup_xml = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+        e1, e1
+    );
+    let dup = s3_request(
+        "POST",
+        &format!("{}/mybucket/order.bin?uploadId={}", base_url, upload_id),
+        dup_xml.into_bytes(),
+    )
+    .await;
+    assert_eq!(dup.status(), 400);
+}
+
+/// A part file whose bytes were corrupted on disk (same size, valid sidecar)
+/// must fail CompleteMultipartUpload instead of producing a silently corrupt
+/// object with a "matching" composite ETag.
+#[tokio::test]
+async fn test_multipart_complete_rejects_tampered_part() {
+    let (base_url, tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/mybucket", base_url), vec![]).await;
+    let create = s3_request(
+        "POST",
+        &format!("{}/mybucket/tamper.bin?uploads=", base_url),
+        vec![],
+    )
+    .await;
+    let upload_id = extract_xml_tag(&create.text().await.unwrap(), "UploadId").unwrap();
+
+    let p1 = vec![b'a'; 5 * 1024 * 1024];
+    let p2 = vec![b'b'; 1024];
+    let e1 = s3_request(
+        "PUT",
+        &format!(
+            "{}/mybucket/tamper.bin?partNumber=1&uploadId={}",
+            base_url, upload_id
+        ),
+        p1,
+    )
+    .await
+    .headers()
+    .get("etag")
+    .unwrap()
+    .to_str()
+    .unwrap()
+    .to_string();
+    let e2 = s3_request(
+        "PUT",
+        &format!(
+            "{}/mybucket/tamper.bin?partNumber=2&uploadId={}",
+            base_url, upload_id
+        ),
+        p2,
+    )
+    .await
+    .headers()
+    .get("etag")
+    .unwrap()
+    .to_str()
+    .unwrap()
+    .to_string();
+
+    // Corrupt part 2 on disk: same length, different bytes → sidecar ETag no
+    // longer matches the data.
+    let part2_path = tmp
+        .path()
+        .join(format!("buckets/mybucket/.uploads/{}/2", upload_id));
+    std::fs::write(&part2_path, vec![b'X'; 1024]).unwrap();
+
+    let complete_xml = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part><Part><PartNumber>2</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+        e1, e2
+    );
+    let complete = s3_request(
+        "POST",
+        &format!("{}/mybucket/tamper.bin?uploadId={}", base_url, upload_id),
+        complete_xml.into_bytes(),
+    )
+    .await;
+    assert_eq!(
+        complete.status(),
+        400,
+        "tampered part must fail Complete, not corrupt the object"
+    );
+
+    // No object must have been published.
+    let get = s3_request("GET", &format!("{}/mybucket/tamper.bin", base_url), vec![]).await;
+    assert_eq!(get.status(), 404);
+}
+
+/// Hammer one key with concurrent overwrites of different sizes; the final
+/// object must be exactly one of the payloads, never a torn mix of one
+/// writer's data with another writer's metadata.
+#[tokio::test]
+async fn test_concurrent_puts_same_key_stay_consistent() {
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/racebucket", base_url), vec![]).await;
+
+    let payload_a = vec![b'a'; 300 * 1024]; // above the small-object threshold
+    let payload_b = vec![b'b'; 100 * 1024]; // below it
+
+    let mut handles = Vec::new();
+    for i in 0..8 {
+        let url = format!("{}/racebucket/contended.bin", base_url);
+        let body = if i % 2 == 0 {
+            payload_a.clone()
+        } else {
+            payload_b.clone()
+        };
+        handles.push(tokio::spawn(async move {
+            let resp = s3_request("PUT", &url, body).await;
+            assert_eq!(resp.status(), 200);
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    let get = s3_request(
+        "GET",
+        &format!("{}/racebucket/contended.bin", base_url),
+        vec![],
+    )
+    .await;
+    assert_eq!(get.status(), 200);
+    let content_length: usize = get
+        .headers()
+        .get("content-length")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let body = get.bytes().await.unwrap();
+    assert_eq!(
+        content_length,
+        body.len(),
+        "Content-Length must match the actual body"
+    );
+    assert!(
+        body.as_ref() == payload_a.as_slice() || body.as_ref() == payload_b.as_slice(),
+        "object must be exactly one writer's payload, got {} bytes",
+        body.len()
+    );
+}
+
+/// Housekeeping must never delete the temp file of an in-flight (young) write.
+#[tokio::test]
+async fn test_housekeeping_keeps_fresh_temp_files() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().to_str().unwrap().to_string();
+    let keyring = Arc::new(Keyring::load(&data_dir, None).await.unwrap());
+    let storage = FilesystemStorage::new(&data_dir, false, 10 * 1024 * 1024, 0, keyring)
+        .await
+        .unwrap();
+    storage
+        .create_bucket(&test_bucket_meta("fresh"))
+        .await
+        .unwrap();
+
+    let temp_path = tmp
+        .path()
+        .join("buckets/fresh/.maxio-tmp-11111111-2222-3333-4444-555555555555");
+    std::fs::write(&temp_path, b"in-flight upload bytes").unwrap();
+
+    storage.housekeeping_sweep(chrono::Duration::days(7)).await;
+    assert!(
+        temp_path.exists(),
+        "young temp file of an in-flight write must survive the sweep"
+    );
+}
+
+/// Housekeeping must restore a crash-stranded EC publish backup when the
+/// original path is missing (the publish died mid-swap).
+#[tokio::test]
+async fn test_housekeeping_restores_stranded_backup() {
+    let tmp = TempDir::new().unwrap();
+    let data_dir = tmp.path().to_str().unwrap().to_string();
+    let keyring = Arc::new(Keyring::load(&data_dir, None).await.unwrap());
+    let storage = FilesystemStorage::new(&data_dir, false, 10 * 1024 * 1024, 0, keyring)
+        .await
+        .unwrap();
+    storage
+        .create_bucket(&test_bucket_meta("bak"))
+        .await
+        .unwrap();
+
+    // Simulate: publish moved `obj.ec` aside as `.maxio-bak-obj.ec` and then
+    // crashed before renaming the new dir in.
+    let backup = tmp.path().join("buckets/bak/.maxio-bak-obj.bin.ec");
+    std::fs::create_dir_all(&backup).unwrap();
+    std::fs::write(backup.join("000000"), b"committed chunk data").unwrap();
+    // Age the backup past the 1-hour recovery gate.
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600);
+    let times = std::fs::FileTimes::new().set_modified(old);
+    std::fs::File::open(&backup).unwrap().set_times(times).unwrap();
+
+    storage.housekeeping_sweep(chrono::Duration::days(7)).await;
+
+    let restored = tmp.path().join("buckets/bak/obj.bin.ec");
+    assert!(
+        restored.is_dir(),
+        "stranded backup must be restored to the original path"
+    );
+    assert_eq!(
+        std::fs::read(restored.join("000000")).unwrap(),
+        b"committed chunk data"
+    );
+    assert!(!backup.exists(), "backup name must be gone after restore");
+}
+
+/// An empty `delimiter=` query parameter means "no delimiter" (AWS semantics).
+/// mc sends `delimiter=` on recursive listings; it must list all keys instead
+/// of collapsing everything into one empty CommonPrefix.
+#[tokio::test]
+async fn test_list_objects_empty_delimiter_means_no_delimiter() {
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/listbucket", base_url), vec![]).await;
+    s3_request(
+        "PUT",
+        &format!("{}/listbucket/a/b/one.txt", base_url),
+        b"1".to_vec(),
+    )
+    .await;
+    s3_request(
+        "PUT",
+        &format!("{}/listbucket/two.txt", base_url),
+        b"2".to_vec(),
+    )
+    .await;
+
+    let resp = s3_request(
+        "GET",
+        &format!(
+            "{}/listbucket/?delimiter=&list-type=2&prefix=",
+            base_url
+        ),
+        vec![],
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("<Key>a/b/one.txt</Key>"), "body: {}", body);
+    assert!(body.contains("<Key>two.txt</Key>"), "body: {}", body);
+    assert!(
+        !body.contains("<CommonPrefixes>"),
+        "empty delimiter must not produce CommonPrefixes: {}",
+        body
+    );
+}
+
+/// A crash-leftover `.maxio-tmp-*` file must not block DeleteBucket.
+#[tokio::test]
+async fn test_delete_bucket_ignores_crash_leftover_temps() {
+    let (base_url, tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/crashbucket", base_url), vec![]).await;
+
+    // Simulate a temp file stranded by a crashed PUT.
+    std::fs::write(
+        tmp.path()
+            .join("buckets/crashbucket/.maxio-tmp-dead-beef-dead-beef"),
+        b"partial bytes from a crashed write",
+    )
+    .unwrap();
+
+    let del = s3_request("DELETE", &format!("{}/crashbucket", base_url), vec![]).await;
+    assert_eq!(
+        del.status(),
+        204,
+        "crash leftovers must not block bucket deletion"
+    );
+    let head = s3_request("HEAD", &format!("{}/crashbucket", base_url), vec![]).await;
+    assert_eq!(head.status(), 404);
 }

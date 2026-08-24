@@ -91,7 +91,10 @@ async fn list_objects_v2(
     params: HashMap<String, String>,
 ) -> Result<Response<Body>, S3Error> {
     let prefix = params.get("prefix").cloned().unwrap_or_default();
-    let delimiter = params.get("delimiter").cloned();
+    // AWS semantics: an empty `delimiter=` parameter means "no delimiter".
+    // With `find("")` matching at position 0, an empty delimiter would
+    // otherwise collapse every key into a single empty CommonPrefix.
+    let delimiter = params.get("delimiter").cloned().filter(|d| !d.is_empty());
     let max_keys = parse_max_keys(&params)?;
     let start_after = params.get("start-after").cloned();
     let continuation_token = params.get("continuation-token").cloned();
@@ -167,7 +170,10 @@ async fn list_objects_v1(
     params: HashMap<String, String>,
 ) -> Result<Response<Body>, S3Error> {
     let prefix = params.get("prefix").cloned().unwrap_or_default();
-    let delimiter = params.get("delimiter").cloned();
+    // AWS semantics: an empty `delimiter=` parameter means "no delimiter".
+    // With `find("")` matching at position 0, an empty delimiter would
+    // otherwise collapse every key into a single empty CommonPrefix.
+    let delimiter = params.get("delimiter").cloned().filter(|d| !d.is_empty());
     let max_keys = parse_max_keys(&params)?;
     let marker = params.get("marker").cloned();
 

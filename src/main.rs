@@ -334,8 +334,29 @@ async fn run_keyring_list(data_dir: &str) -> anyhow::Result<()> {
 }
 
 async fn shutdown_signal() {
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to install CTRL+C signal handler");
-    tracing::info!("Shutdown signal received, draining connections...");
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install CTRL+C signal handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            tracing::info!("SIGINT (Ctrl+C) received, draining connections...");
+        }
+        _ = terminate => {
+            tracing::info!("SIGTERM received, draining connections...");
+        }
+    }
 }

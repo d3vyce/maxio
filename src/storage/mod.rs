@@ -373,6 +373,8 @@ pub enum StorageError {
     InvalidKey(String),
     #[error("Multipart upload not found: {0}")]
     UploadNotFound(String),
+    #[error("Parts are not in ascending order")]
+    InvalidPartOrder,
     #[error("Version not found: {0}")]
     VersionNotFound(String),
     #[error("Checksum mismatch: {0}")]
