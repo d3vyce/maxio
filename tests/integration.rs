@@ -6952,7 +6952,10 @@ async fn test_null_version_preserved_on_overwrite() {
 
     // Current object is the new content.
     let get = s3_request("GET", &format!("{}/nullver/doc.txt", base_url), vec![]).await;
-    assert_eq!(get.bytes().await.unwrap().as_ref(), b"new versioned content");
+    assert_eq!(
+        get.bytes().await.unwrap().as_ref(),
+        b"new versioned content"
+    );
 
     // The pre-versioning object must still be retrievable as version "null".
     let get_null = s3_request(
@@ -6962,7 +6965,10 @@ async fn test_null_version_preserved_on_overwrite() {
     )
     .await;
     assert_eq!(get_null.status(), 200, "null version must be preserved");
-    assert_eq!(get_null.bytes().await.unwrap().as_ref(), original.as_slice());
+    assert_eq!(
+        get_null.bytes().await.unwrap().as_ref(),
+        original.as_slice()
+    );
 }
 
 /// Deleting the newest version must fall back to the archived null version,
@@ -7003,11 +7009,19 @@ async fn test_null_version_restored_after_newest_version_deleted() {
         vec![],
     )
     .await;
-    assert!(del.status().is_success(), "delete of v2 failed: {}", del.status());
+    assert!(
+        del.status().is_success(),
+        "delete of v2 failed: {}",
+        del.status()
+    );
 
     // The null version must be promoted back to current.
     let get = s3_request("GET", &format!("{}/nullrestore/doc.txt", base_url), vec![]).await;
-    assert_eq!(get.status(), 200, "null version must be restored as current");
+    assert_eq!(
+        get.status(),
+        200,
+        "null version must be restored as current"
+    );
     assert_eq!(get.bytes().await.unwrap().as_ref(), original.as_slice());
 }
 
@@ -7044,8 +7058,15 @@ async fn test_null_version_preserved_on_delete_marker() {
         vec![],
     )
     .await;
-    assert_eq!(get_null.status(), 200, "delete marker must not destroy the null version");
-    assert_eq!(get_null.bytes().await.unwrap().as_ref(), original.as_slice());
+    assert_eq!(
+        get_null.status(),
+        200,
+        "delete marker must not destroy the null version"
+    );
+    assert_eq!(
+        get_null.bytes().await.unwrap().as_ref(),
+        original.as_slice()
+    );
 }
 
 /// CompleteMultipartUpload with parts out of ascending order must be rejected
@@ -7309,7 +7330,10 @@ async fn test_housekeeping_restores_stranded_backup() {
     // Age the backup past the 1-hour recovery gate.
     let old = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 3600);
     let times = std::fs::FileTimes::new().set_modified(old);
-    std::fs::File::open(&backup).unwrap().set_times(times).unwrap();
+    std::fs::File::open(&backup)
+        .unwrap()
+        .set_times(times)
+        .unwrap();
 
     storage.housekeeping_sweep(chrono::Duration::days(7)).await;
 
@@ -7347,10 +7371,7 @@ async fn test_list_objects_empty_delimiter_means_no_delimiter() {
 
     let resp = s3_request(
         "GET",
-        &format!(
-            "{}/listbucket/?delimiter=&list-type=2&prefix=",
-            base_url
-        ),
+        &format!("{}/listbucket/?delimiter=&list-type=2&prefix=", base_url),
         vec![],
     )
     .await;
@@ -7387,4 +7408,276 @@ async fn test_delete_bucket_ignores_crash_leftover_temps() {
     );
     let head = s3_request("HEAD", &format!("{}/crashbucket", base_url), vec![]).await;
     assert_eq!(head.status(), 404);
+}
+
+// ── User metadata (x-amz-meta-*) ─────────────────────────────────────────────
+
+/// Read every `x-amz-meta-*` header off a response, prefix stripped.
+fn user_meta(resp: &reqwest::Response) -> std::collections::BTreeMap<String, String> {
+    resp.headers()
+        .iter()
+        .filter_map(|(k, v)| {
+            k.as_str()
+                .strip_prefix("x-amz-meta-")
+                .map(|name| (name.to_string(), v.to_str().unwrap().to_string()))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn test_user_metadata_roundtrip() {
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/umeta", base_url), vec![]).await;
+
+    let put = s3_request_with_headers(
+        "PUT",
+        &format!("{}/umeta/a.txt", base_url),
+        b"hello world".to_vec(),
+        vec![
+            // Mixed case on the way in: S3 stores metadata names lowercased.
+            ("x-amz-meta-Alembic-Revision", "e8b2f47c1a90"),
+            ("x-amz-meta-owner", "nexctf"),
+        ],
+    )
+    .await;
+    assert_eq!(put.status(), 200);
+
+    let expected: std::collections::BTreeMap<String, String> = [
+        ("alembic-revision".to_string(), "e8b2f47c1a90".to_string()),
+        ("owner".to_string(), "nexctf".to_string()),
+    ]
+    .into_iter()
+    .collect();
+
+    let head = s3_request("HEAD", &format!("{}/umeta/a.txt", base_url), vec![]).await;
+    assert_eq!(user_meta(&head), expected, "HEAD must return user metadata");
+
+    let get = s3_request("GET", &format!("{}/umeta/a.txt", base_url), vec![]).await;
+    assert_eq!(user_meta(&get), expected, "GET must return user metadata");
+
+    let ranged = s3_request_with_headers(
+        "GET",
+        &format!("{}/umeta/a.txt", base_url),
+        vec![],
+        vec![("Range", "bytes=0-3")],
+    )
+    .await;
+    assert_eq!(ranged.status(), 206);
+    assert_eq!(user_meta(&ranged), expected, "range GET must return it too");
+}
+
+#[tokio::test]
+async fn test_user_metadata_absent_emits_no_headers() {
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/umeta-none", base_url), vec![]).await;
+    s3_request(
+        "PUT",
+        &format!("{}/umeta-none/a.txt", base_url),
+        b"x".to_vec(),
+    )
+    .await;
+
+    let head = s3_request("HEAD", &format!("{}/umeta-none/a.txt", base_url), vec![]).await;
+    assert!(user_meta(&head).is_empty());
+}
+
+#[tokio::test]
+async fn test_user_metadata_copy_directive() {
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/umeta-cp", base_url), vec![]).await;
+    s3_request_with_headers(
+        "PUT",
+        &format!("{}/umeta-cp/src.txt", base_url),
+        b"payload".to_vec(),
+        vec![("x-amz-meta-rev", "abc123")],
+    )
+    .await;
+
+    // Default directive is COPY: metadata carries forward.
+    let copied = s3_request_with_headers(
+        "PUT",
+        &format!("{}/umeta-cp/copy.txt", base_url),
+        vec![],
+        vec![("x-amz-copy-source", "/umeta-cp/src.txt")],
+    )
+    .await;
+    assert_eq!(copied.status(), 200);
+    let head = s3_request("HEAD", &format!("{}/umeta-cp/copy.txt", base_url), vec![]).await;
+    assert_eq!(
+        user_meta(&head).get("rev").map(String::as_str),
+        Some("abc123")
+    );
+
+    // REPLACE takes the request's metadata wholesale.
+    let replaced = s3_request_with_headers(
+        "PUT",
+        &format!("{}/umeta-cp/repl.txt", base_url),
+        vec![],
+        vec![
+            ("x-amz-copy-source", "/umeta-cp/src.txt"),
+            ("x-amz-metadata-directive", "REPLACE"),
+            ("x-amz-meta-fresh", "yes"),
+        ],
+    )
+    .await;
+    assert_eq!(replaced.status(), 200);
+    let head = s3_request("HEAD", &format!("{}/umeta-cp/repl.txt", base_url), vec![]).await;
+    assert_eq!(
+        user_meta(&head).get("fresh").map(String::as_str),
+        Some("yes")
+    );
+    assert!(
+        !user_meta(&head).contains_key("rev"),
+        "REPLACE must not inherit source metadata"
+    );
+
+    // REPLACE with no metadata headers empties it rather than falling back.
+    let cleared = s3_request_with_headers(
+        "PUT",
+        &format!("{}/umeta-cp/clear.txt", base_url),
+        vec![],
+        vec![
+            ("x-amz-copy-source", "/umeta-cp/src.txt"),
+            ("x-amz-metadata-directive", "REPLACE"),
+        ],
+    )
+    .await;
+    assert_eq!(cleared.status(), 200);
+    let head = s3_request("HEAD", &format!("{}/umeta-cp/clear.txt", base_url), vec![]).await;
+    assert!(user_meta(&head).is_empty());
+}
+
+#[tokio::test]
+async fn test_user_metadata_too_large_rejected() {
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/umeta-big", base_url), vec![]).await;
+
+    let big = "x".repeat(3000);
+    let resp = s3_request_with_headers(
+        "PUT",
+        &format!("{}/umeta-big/a.txt", base_url),
+        b"x".to_vec(),
+        vec![("x-amz-meta-big", big.as_str())],
+    )
+    .await;
+    assert_eq!(resp.status(), 400);
+    assert!(resp.text().await.unwrap().contains("MetadataTooLarge"));
+
+    // Nothing was written.
+    let head = s3_request("HEAD", &format!("{}/umeta-big/a.txt", base_url), vec![]).await;
+    assert_eq!(head.status(), 404);
+}
+
+#[tokio::test]
+async fn test_user_metadata_multipart() {
+    let (base_url, _tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/umeta-mp", base_url), vec![]).await;
+
+    let init = s3_request_with_headers(
+        "POST",
+        &format!("{}/umeta-mp/big.bin?uploads", base_url),
+        vec![],
+        vec![("x-amz-meta-rev", "mp-revision")],
+    )
+    .await;
+    assert_eq!(init.status(), 200);
+    let upload_id = init
+        .text()
+        .await
+        .unwrap()
+        .split("<UploadId>")
+        .nth(1)
+        .and_then(|s| s.split("</UploadId>").next())
+        .expect("UploadId in response")
+        .to_string();
+
+    let part = vec![b'a'; 5 * 1024 * 1024];
+    let put_part = s3_request(
+        "PUT",
+        &format!(
+            "{}/umeta-mp/big.bin?partNumber=1&uploadId={}",
+            base_url, upload_id
+        ),
+        part,
+    )
+    .await;
+    assert_eq!(put_part.status(), 200);
+    let etag = put_part
+        .headers()
+        .get("etag")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let complete = s3_request(
+        "POST",
+        &format!("{}/umeta-mp/big.bin?uploadId={}", base_url, upload_id),
+        format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+            etag
+        )
+        .into_bytes(),
+    )
+    .await;
+    assert_eq!(complete.status(), 200);
+
+    let head = s3_request("HEAD", &format!("{}/umeta-mp/big.bin", base_url), vec![]).await;
+    assert_eq!(
+        user_meta(&head).get("rev").map(String::as_str),
+        Some("mp-revision"),
+        "metadata set at CreateMultipartUpload must survive completion"
+    );
+}
+
+#[tokio::test]
+async fn test_user_metadata_bound_into_sidecar_mac() {
+    let (base_url, tmp) = start_server().await;
+    s3_request("PUT", &format!("{}/umeta-sse", base_url), vec![]).await;
+    s3_request_with_headers(
+        "PUT",
+        &format!("{}/umeta-sse/a.txt", base_url),
+        b"secret".to_vec(),
+        vec![
+            ("x-amz-server-side-encryption", "AES256"),
+            ("x-amz-meta-rev", "abc123"),
+        ],
+    )
+    .await;
+
+    let head = s3_request("HEAD", &format!("{}/umeta-sse/a.txt", base_url), vec![]).await;
+    assert_eq!(
+        user_meta(&head).get("rev").map(String::as_str),
+        Some("abc123")
+    );
+
+    // User metadata is immutable after write, so it stays inside the MAC —
+    // unlike tags, which mac_input deliberately strips.
+    let meta_path = tmp.path().join("buckets/umeta-sse/a.txt.meta.json");
+    let mut meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+    meta["user_metadata"]["rev"] = serde_json::json!("TAMPERED");
+    std::fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+
+    let get = s3_request("GET", &format!("{}/umeta-sse/a.txt", base_url), vec![]).await;
+    assert_eq!(get.status(), 400, "tampered user metadata must be rejected");
+}
+
+#[tokio::test]
+async fn test_user_metadata_erasure_coded() {
+    let (base_url, _tmp) = start_server_ec().await;
+    s3_request("PUT", &format!("{}/umeta-ec", base_url), vec![]).await;
+    s3_request_with_headers(
+        "PUT",
+        &format!("{}/umeta-ec/a.bin", base_url),
+        vec![b'z'; 300 * 1024],
+        vec![("x-amz-meta-rev", "ec-revision")],
+    )
+    .await;
+
+    let head = s3_request("HEAD", &format!("{}/umeta-ec/a.bin", base_url), vec![]).await;
+    assert_eq!(
+        user_meta(&head).get("rev").map(String::as_str),
+        Some("ec-revision")
+    );
 }

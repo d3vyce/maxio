@@ -43,6 +43,7 @@ pub async fn create_multipart_upload(
         }
     }
     let encryption_spec = encryption.as_ref().map(spec_from_request);
+    let user_metadata = super::object::extract_user_metadata(&headers)?;
     let applied_mode = encryption.as_ref().map(|e| e.mode.clone());
 
     let upload = state
@@ -53,6 +54,7 @@ pub async fn create_multipart_upload(
             content_type,
             checksum_algorithm,
             encryption_spec,
+            user_metadata,
         )
         .await
         .map_err(map_storage_err)?;

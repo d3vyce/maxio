@@ -16,6 +16,7 @@ use hmac::{Hmac, Mac};
 use md5::{Digest, Md5};
 use rand::RngExt;
 use sha2::Sha256;
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tokio::fs;
@@ -587,6 +588,7 @@ impl FilesystemStorage {
         mut body: ByteStream,
         checksum: Option<(ChecksumAlgorithm, Option<String>)>,
         encryption: Option<EncryptionRequest>,
+        user_metadata: Option<HashMap<String, String>>,
     ) -> Result<PutResult, StorageError> {
         validate_bucket_name(bucket)?;
         validate_key(key)?;
@@ -599,7 +601,15 @@ impl FilesystemStorage {
         if self.erasure_coding {
             if let Some(req) = encryption {
                 return self
-                    .put_object_chunked_encrypted(bucket, key, content_type, body, checksum, req)
+                    .put_object_chunked_encrypted(
+                        bucket,
+                        key,
+                        content_type,
+                        body,
+                        checksum,
+                        req,
+                        user_metadata,
+                    )
                     .await;
             }
             return self
@@ -609,6 +619,7 @@ impl FilesystemStorage {
                     content_type,
                     body,
                     checksum.as_ref().map(|(a, _)| *a),
+                    user_metadata,
                 )
                 .await;
         }
@@ -751,6 +762,7 @@ impl FilesystemStorage {
             checksum_algorithm,
             checksum_value: checksum_value.clone(),
             tags: None,
+            user_metadata,
             part_sizes: None,
             encryption: enc_meta_opt.take(),
         };
@@ -781,7 +793,8 @@ impl FilesystemStorage {
                 // Archive a pre-versioning ("null") current object instead of
                 // destroying it.
                 self.archive_null_version_if_needed(bucket, key).await?;
-                self.write_version(bucket, key, &meta, &tmp_obj_path).await?;
+                self.write_version(bucket, key, &meta, &tmp_obj_path)
+                    .await?;
             }
             publish_temp_payload_and_meta(
                 &tmp_obj_path,
@@ -822,6 +835,7 @@ impl FilesystemStorage {
         content_type: &str,
         mut body: ByteStream,
         checksum_algo: Option<ChecksumAlgorithm>,
+        user_metadata: Option<HashMap<String, String>>,
     ) -> Result<PutResult, StorageError> {
         validate_bucket_name(bucket)?;
         let ec_dir = self.ec_dir(bucket, key);
@@ -937,6 +951,7 @@ impl FilesystemStorage {
             checksum_algorithm: checksum_algo,
             checksum_value: checksum_value.clone(),
             tags: None,
+            user_metadata,
             part_sizes: None,
             encryption: None,
         };
@@ -995,6 +1010,7 @@ impl FilesystemStorage {
         mut body: ByteStream,
         checksum: Option<(ChecksumAlgorithm, Option<String>)>,
         encryption: EncryptionRequest,
+        user_metadata: Option<HashMap<String, String>>,
     ) -> Result<PutResult, StorageError> {
         validate_bucket_name(bucket)?;
         let ec_dir = self.ec_dir(bucket, key);
@@ -1176,6 +1192,7 @@ impl FilesystemStorage {
             checksum_algorithm: ck_algo,
             checksum_value: ck_val.clone(),
             tags: None,
+            user_metadata,
             part_sizes: None,
             encryption: Some(enc_meta),
         };
@@ -1690,6 +1707,7 @@ impl FilesystemStorage {
             checksum_algorithm,
             checksum_value: checksum_value.clone(),
             tags: None,
+            user_metadata: upload_meta.user_metadata.clone(),
             part_sizes: Some(part_sizes),
             encryption: None,
         };
@@ -1977,6 +1995,7 @@ impl FilesystemStorage {
             checksum_algorithm,
             checksum_value: checksum_value.clone(),
             tags: None,
+            user_metadata: upload_meta.user_metadata.clone(),
             part_sizes: Some(part_sizes),
             encryption: Some(enc_meta),
         };
@@ -2061,6 +2080,7 @@ impl FilesystemStorage {
             checksum_algorithm: None,
             checksum_value: None,
             tags: None,
+            user_metadata: None,
             part_sizes: None,
             encryption: None,
         };
@@ -2382,6 +2402,7 @@ impl FilesystemStorage {
         content_type: &str,
         checksum_algorithm: Option<ChecksumAlgorithm>,
         encryption_spec: Option<UploadEncryptionSpec>,
+        user_metadata: Option<HashMap<String, String>>,
     ) -> Result<MultipartUploadMeta, StorageError> {
         validate_bucket_name(bucket)?;
         validate_key(key)?;
@@ -2421,6 +2442,7 @@ impl FilesystemStorage {
             initiated: chrono::Utc::now()
                 .format("%Y-%m-%dT%H:%M:%S%.3fZ")
                 .to_string(),
+            user_metadata,
             checksum_algorithm,
             encryption_spec,
         };
@@ -2905,6 +2927,7 @@ impl FilesystemStorage {
             checksum_algorithm,
             checksum_value: checksum_value.clone(),
             tags: None,
+            user_metadata: upload_meta.user_metadata.clone(),
             part_sizes: Some(part_sizes),
             encryption: enc_meta_opt,
         };
@@ -3500,7 +3523,8 @@ impl FilesystemStorage {
     }
 
     pub async fn delete_bucket_cors(&self, bucket: &str) -> Result<(), StorageError> {
-        self.update_bucket_meta(bucket, |m| m.cors_rules = None).await
+        self.update_bucket_meta(bucket, |m| m.cors_rules = None)
+            .await
     }
 
     // --- Bucket default encryption ---
@@ -3895,6 +3919,7 @@ impl FilesystemStorage {
             checksum_algorithm: None,
             checksum_value: None,
             tags: None,
+            user_metadata: None,
             part_sizes: None,
             encryption: None,
         };
@@ -4004,8 +4029,14 @@ impl FilesystemStorage {
                 let tmp_data = temp_sibling_path(&obj_path);
                 let mut tmp_data_guard = TempPathGuard::file(tmp_data.clone());
                 fs::copy(&ver_data, &tmp_data).await?;
-                publish_temp_payload_and_meta(&tmp_data, &obj_path, false, &tmp_meta, &obj_meta_path)
-                    .await?;
+                publish_temp_payload_and_meta(
+                    &tmp_data,
+                    &obj_path,
+                    false,
+                    &tmp_meta,
+                    &obj_meta_path,
+                )
+                .await?;
                 tmp_data_guard.disarm();
                 tmp_meta_guard.disarm();
                 remove_dir_all_if_exists(&self.ec_dir(bucket, key)).await?;
